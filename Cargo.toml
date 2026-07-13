@@ -1,0 +1,23 @@
+[package]
+name = "rlbot-rocketsim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+glam = "0.33.0"
+rlbot = {
+  git = "https://github.com/RLBot/rust-interface.git",
+  rev = "81c99a8c50304c1a2e5fe9b6b31413d5fe8a6141",
+  default-features = false
+}
+rocketsim = {
+  git = "https://github.com/ZealanL/RocketSim.git",
+  branch = "v3-rust"
+}
+thiserror = "2.0.18"
+
+[patch."https://github.com/ZealanL/RocketSim.git"]
+rocketsim = {
+  git = "https://github.com/VirxEC/RocketSim.git",
+  branch = "fix-jump"
+}
