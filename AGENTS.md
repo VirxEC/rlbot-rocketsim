@@ -1,5 +1,27 @@
 # Agent guidance
 
+## Sources of truth
+
+Use sources in this order when resolving conversion semantics:
+
+1. The documentation on the pinned `rlbot::flat` Rust types used by this crate.
+2. The pinned RLBot FlatBuffer schemas in the `rlbot` dependency's
+   `flatbuffers-schema/schema/` directory, especially `gamedata.fbs`,
+   `matchconfig.fbs`, and `vector.fbs`.
+3. The Cargo-locked RocketSim source used by this crate, especially
+   `CarState`, `Car::update_jump`, `Car::update_double_jump_or_flip`, wheel
+   contact updates, boost-pad state, and arena lifecycle APIs.
+4. This repository's semantic regression tests, especially the Soccar packet
+   sequence and contact tests.
+5. [`JPK314/rlgym-compat`](https://github.com/JPK314/rlgym-compat/tree/main/rlgym_compat)
+   as a behavioral comparison for RLBot packet handling and RocketSim v2
+   enrichment through Python bindings.
+
+The pinned RLBot documentation/schema and the exact RocketSim version used by
+this crate take precedence over `rlgym-compat` when they disagree. Reference
+implementations can contain approximations or target different dependency
+versions.
+
 ## RLBot semantics
 
 Do not infer RLBot field meanings from their names or from RocketSim's similarly

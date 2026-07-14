@@ -123,19 +123,21 @@ pub fn car_to_player_info_with_history(
         AirState::InAir
     };
 
+    let initial_jump_duration = history
+        .initial_jump_duration
+        .clamp(0.0, rocketsim::consts::car::jump::MAX_TIME);
+    let dodge_time_remaining = rocketsim::consts::car::jump::DOUBLEJUMP_MAX_DELAY
+        + initial_jump_duration
+        - state.air_time_since_jump;
     let dodge_timeout = if air_state == AirState::OnGround
         || !state.has_jumped
         || state.has_double_jumped
         || state.has_flipped
-        || state.air_time_since_jump >= rocketsim::consts::car::jump::DOUBLEJUMP_MAX_DELAY
+        || dodge_time_remaining <= 0.0
     {
         -1.0
     } else {
-        rocketsim::consts::car::jump::DOUBLEJUMP_MAX_DELAY
-            + history
-                .initial_jump_duration
-                .clamp(0.0, rocketsim::consts::car::jump::MAX_TIME)
-            - state.air_time_since_jump
+        dodge_time_remaining
     };
 
     let (name, is_bot) = player_name_and_bot(&player_config.variety, info.idx);
@@ -319,6 +321,61 @@ mod tests {
         )
         .unwrap();
         assert!((converted.dodge_timeout - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn conversion_history_includes_hold_extension_during_initial_jump() {
+        let info = CarInfo {
+            idx: 0,
+            team: Team::Blue,
+            config: CarBodyConfig::OCTANE,
+        };
+        let state = CarState {
+            is_on_ground: true,
+            is_jumping: true,
+            has_jumped: true,
+            jump_time: 0.1,
+            ..CarState::default()
+        };
+
+        let converted = car_to_player_info_with_history(
+            &info,
+            &state,
+            &player(0, 23),
+            CarConversionHistory {
+                initial_jump_duration: 0.1,
+                double_jump_active_time: 0.0,
+            },
+        )
+        .unwrap();
+        assert!((converted.dodge_timeout - 1.35).abs() < 1e-5);
+    }
+
+    #[test]
+    fn conversion_history_retains_jump_extension_after_base_window() {
+        let info = CarInfo {
+            idx: 0,
+            team: Team::Blue,
+            config: CarBodyConfig::OCTANE,
+        };
+        let state = CarState {
+            is_on_ground: false,
+            has_jumped: true,
+            air_time_since_jump: 1.25,
+            ..CarState::default()
+        };
+
+        let converted = car_to_player_info_with_history(
+            &info,
+            &state,
+            &player(0, 23),
+            CarConversionHistory {
+                initial_jump_duration: 0.2,
+                double_jump_active_time: 0.0,
+            },
+        )
+        .unwrap();
+        assert!((converted.dodge_timeout - 0.2).abs() < 1e-5);
     }
 
     #[test]

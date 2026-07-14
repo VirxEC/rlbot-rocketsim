@@ -136,32 +136,41 @@ impl GameStateEnricher {
         let frame = packet.match_info.frame_num;
         let frame_rollback = self.last_frame.is_some_and(|last| frame < last);
         let layout_changed = self.layout_changed(packet)?;
-        if frame_rollback || layout_changed {
+        let gravity_changed =
+            self.arena_config.mutators.gravity.z != packet.match_info.world_gravity_z;
+        if gravity_changed {
+            self.arena_config.mutators.gravity.z = packet.match_info.world_gravity_z;
+        }
+        if frame_rollback || layout_changed || gravity_changed {
             self.rebuild_arena();
         }
 
         let resumed_after_inactive = phase_advances(packet.match_info.match_phase)
             && self.last_phase.is_some_and(|phase| !phase_advances(phase));
-        let reset_history =
-            self.last_frame.is_none() || frame_rollback || layout_changed || resumed_after_inactive;
-        let ticks_to_step = self.ticks_to_step(packet);
+        let reset_history = self.last_frame.is_none()
+            || frame_rollback
+            || layout_changed
+            || gravity_changed
+            || resumed_after_inactive;
+        let should_step = self.should_step(packet);
         if reset_history {
             for tracked in &mut self.players {
                 tracked.initial_jump_duration = 0.0;
             }
         }
         let resolved = self.resolve_players(packet)?;
-        self.apply_players(packet, &resolved, reset_history);
-        self.sync_ball(packet)?;
-        self.sync_boost_pads(packet)?;
 
-        for _ in 0..ticks_to_step {
+        if should_step {
+            for (player, resolved) in packet.players.iter().zip(&resolved) {
+                self.arena
+                    .set_car_controls(resolved.car_index, controls_from_rlbot(player.last_input));
+            }
             self.arena.step_tick();
         }
 
-        self.restore_authoritative_ball(packet);
-        self.restore_authoritative_boost_pads(packet)?;
-        self.restore_authoritative_players(packet);
+        self.apply_players(packet, &resolved, reset_history, should_step);
+        self.sync_ball(packet)?;
+        self.sync_boost_pads(packet)?;
         self.last_frame = Some(frame);
         self.last_phase = Some(packet.match_info.match_phase);
 
@@ -275,11 +284,11 @@ impl GameStateEnricher {
         self.last_phase = None;
     }
 
-    fn ticks_to_step(&self, packet: &GamePacket) -> u32 {
-        u32::from(
-            phase_advances(packet.match_info.match_phase)
-                && self.last_frame != Some(packet.match_info.frame_num),
-        )
+    fn should_step(&self, packet: &GamePacket) -> bool {
+        phase_advances(packet.match_info.match_phase)
+            && self
+                .last_frame
+                .is_some_and(|last| packet.match_info.frame_num > last)
     }
 
     fn resolve_players(
@@ -325,21 +334,27 @@ impl GameStateEnricher {
         packet: &GamePacket,
         resolved: &[ResolvedPlayer],
         reset_history: bool,
+        stepped: bool,
     ) {
         for (index, (player, resolved)) in packet.players.iter().zip(resolved).enumerate() {
-            let previous = *self.arena.get_car_state(resolved.car_index);
-            let previous_controls = if reset_history {
+            let mut simulated = *self.arena.get_car_state(resolved.car_index);
+            simulated.is_on_ground = simulated.num_wheels_in_contact() >= 3;
+            let previous_controls = if stepped {
+                simulated.prev_controls
+            } else if reset_history {
                 controls_from_rlbot(player.last_input)
             } else {
                 resolved.previous_controls
             };
             let state = merge_authoritative_player(
                 player,
-                previous,
+                simulated,
                 previous_controls,
                 resolved.initial_jump_duration,
                 reset_history,
             );
+            let mut state = state;
+            preserve_simulated_contacts(simulated, &mut state);
             self.arena.set_car_state(resolved.car_index, state);
             self.arena
                 .set_car_controls(resolved.car_index, state.controls);
@@ -350,22 +365,6 @@ impl GameStateEnricher {
             } else if !player.has_jumped {
                 self.players[index].initial_jump_duration = 0.0;
             }
-        }
-    }
-
-    fn restore_authoritative_players(&mut self, packet: &GamePacket) {
-        for (index, player) in packet.players.iter().enumerate() {
-            let car_index = self.players[index].car_index;
-            let mut simulated = *self.arena.get_car_state(car_index);
-            simulated.is_on_ground = simulated.num_wheels_in_contact() >= 3;
-            let mut state = simulated;
-            restore_authoritative_player(
-                player,
-                &mut state,
-                self.players[index].initial_jump_duration,
-            );
-            preserve_simulated_contacts(simulated, &mut state);
-            self.arena.set_car_state(car_index, state);
         }
     }
 
@@ -402,23 +401,7 @@ impl GameStateEnricher {
         Ok(())
     }
 
-    fn restore_authoritative_ball(&mut self, packet: &GamePacket) {
-        let [ball] = packet.balls.as_slice() else {
-            return;
-        };
-        let mut state = *self.arena.get_ball_state();
-        apply_ball(ball, &mut state);
-        self.arena.set_ball_state(state);
-    }
-
     fn sync_boost_pads(&mut self, packet: &GamePacket) -> Result<(), EnrichmentError> {
-        apply_boost_pads(&mut self.arena, packet)
-    }
-
-    fn restore_authoritative_boost_pads(
-        &mut self,
-        packet: &GamePacket,
-    ) -> Result<(), EnrichmentError> {
         apply_boost_pads(&mut self.arena, packet)
     }
 }
@@ -719,6 +702,56 @@ mod tests {
         enricher.update(&packet(2, replacement)).unwrap();
 
         assert_eq!(enricher.arena().num_cars(), 1);
+    }
+
+    #[test]
+    fn probe_retains_the_immediately_previous_controls() {
+        let arena = Arena::new(GameMode::TheVoid);
+        let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::default());
+        let mut held = player();
+        held.last_input.jump = true;
+
+        enricher.update(&packet(1, held.clone())).unwrap();
+        enricher.update(&packet(2, held.clone())).unwrap();
+        assert!(enricher.car_state(0).unwrap().prev_controls.jump);
+
+        let mut released = held;
+        released.last_input.jump = false;
+        enricher.update(&packet(3, released)).unwrap();
+        assert!(!enricher.car_state(0).unwrap().prev_controls.jump);
+    }
+
+    #[test]
+    fn packet_gravity_reconfigures_the_probe_arena() {
+        let arena = Arena::new(GameMode::TheVoid);
+        let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::default());
+        let mut packet = packet(1, player());
+        packet.match_info.world_gravity_z = 325.0;
+
+        enricher.update(&packet).unwrap();
+
+        assert_eq!(enricher.arena().mutator_config().gravity.z, 325.0);
+        assert_eq!(enricher.arena_config.mutators.gravity.z, 325.0);
+    }
+
+    #[test]
+    fn gravity_changes_rebuild_the_arena_and_reset_history() {
+        let arena = Arena::new(GameMode::TheVoid);
+        let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::default());
+        let mut first = packet(1, player());
+        first.match_info.world_gravity_z = -650.0;
+        enricher.update(&first).unwrap();
+        let mut state = *enricher.car_state(0).unwrap();
+        state.handbrake_val = 0.5;
+        enricher.arena_mut().set_car_state(0, state);
+
+        let mut changed = packet(2, player());
+        changed.match_info.world_gravity_z = 325.0;
+        enricher.update(&changed).unwrap();
+
+        assert_eq!(enricher.arena().mutator_config().gravity.z, 325.0);
+        assert_eq!(enricher.arena().num_cars(), 1);
+        assert_eq!(enricher.car_state(0).unwrap().handbrake_val, 0.0);
     }
 
     #[test]
