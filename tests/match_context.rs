@@ -105,8 +105,43 @@ fn builds_match_from_config_field_and_packet_data() {
     );
     assert_eq!(enricher.arena().get_car_info(0).idx, 0);
     assert_eq!(enricher.ball_state().phys.pos.x, 500.0);
-    assert!((enricher.arena().get_boost_pad_state(0).cooldown - 4.25).abs() < 1e-5);
+    // RLBot's timer is elapsed since pickup; RocketSim's cooldown is time remaining.
+    assert!((enricher.arena().get_boost_pad_state(0).cooldown - 5.75).abs() < 1e-5);
     assert_eq!(enricher.arena().get_boost_pad_config(0).pos.x, 100.0);
+}
+
+#[test]
+fn rejects_duplicate_configured_player_ids() {
+    let mut config = match_config(29);
+    config
+        .player_configurations
+        .push(config.player_configurations[0].clone());
+
+    assert_eq!(
+        MatchContext::new(&config, &field_info()).unwrap_err(),
+        MatchContextError::DuplicatePlayerId { player_id: 7 }
+    );
+}
+
+#[test]
+fn requires_all_boost_pad_states() {
+    init_from_default(true).unwrap();
+
+    let context = MatchContext::new(&match_config(29), &field_info()).unwrap();
+    let mut enricher = GameStateEnricher::from_match_context(context);
+    let mut packet = GamePacket::default();
+    packet.players.push(dominus_player());
+    packet.balls.push(standard_ball());
+
+    assert_eq!(
+        enricher.update(&packet),
+        Err(EnrichmentError::MatchContext(
+            MatchContextError::BoostPadCountMismatch {
+                packet: 0,
+                arena: 1,
+            }
+        ))
+    );
 }
 
 #[test]
@@ -172,6 +207,10 @@ fn rejects_hitbox_that_disagrees_with_loadout() {
     let mut packet = GamePacket::default();
     packet.players.push(player);
     packet.balls.push(standard_ball());
+    packet.boost_pads.push(BoostPadState {
+        is_active: true,
+        timer: 0.0,
+    });
 
     assert_eq!(
         enricher.update(&packet),

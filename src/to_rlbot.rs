@@ -27,6 +27,14 @@ pub enum ToRlbotError {
     UnknownCarProductId { player_id: i32, product_id: u32 },
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CarConversionHistory {
+    /// Duration of the initial jump force, clamped to Rocket League's 0.2-second maximum.
+    pub initial_jump_duration: f32,
+    /// Seconds remaining in RLBot's active 13-tick double-jump state.
+    pub double_jump_active_time: f32,
+}
+
 pub trait CarInfoExt {
     fn to_rlbot_player_info(
         &self,
@@ -92,19 +100,30 @@ pub fn car_to_player_info(
     state: &CarState,
     player_config: &PlayerConfiguration,
 ) -> Result<PlayerInfo, ToRlbotError> {
+    car_to_player_info_with_history(info, state, player_config, CarConversionHistory::default())
+}
+
+pub fn car_to_player_info_with_history(
+    info: &CarInfo,
+    state: &CarState,
+    player_config: &PlayerConfiguration,
+    history: CarConversionHistory,
+) -> Result<PlayerInfo, ToRlbotError> {
     validate_player_config(info, player_config)?;
 
-    let air_state = if state.is_on_ground {
-        AirState::OnGround
-    } else if state.is_jumping {
+    let air_state = if state.is_jumping {
         AirState::Jumping
     } else if state.is_flipping {
         AirState::Dodging
+    } else if history.double_jump_active_time > 0.0 && state.has_double_jumped {
+        AirState::DoubleJumping
+    } else if state.is_on_ground {
+        AirState::OnGround
     } else {
         AirState::InAir
     };
 
-    let dodge_timeout = if state.is_on_ground
+    let dodge_timeout = if air_state == AirState::OnGround
         || !state.has_jumped
         || state.has_double_jumped
         || state.has_flipped
@@ -112,7 +131,11 @@ pub fn car_to_player_info(
     {
         -1.0
     } else {
-        rocketsim::consts::car::jump::DOUBLEJUMP_MAX_DELAY - state.air_time_since_jump
+        rocketsim::consts::car::jump::DOUBLEJUMP_MAX_DELAY
+            + history
+                .initial_jump_duration
+                .clamp(0.0, rocketsim::consts::car::jump::MAX_TIME)
+            - state.air_time_since_jump
     };
 
     let (name, is_bot) = player_name_and_bot(&player_config.variety, info.idx);
@@ -144,7 +167,11 @@ pub fn car_to_player_info(
         has_jumped: state.has_jumped,
         has_double_jumped: state.has_double_jumped,
         has_dodged: state.has_flipped,
-        dodge_elapsed: state.flip_time,
+        dodge_elapsed: if state.is_on_ground {
+            0.0
+        } else {
+            state.flip_time
+        },
         dodge_dir,
         ..PlayerInfo::default()
     })
@@ -217,6 +244,156 @@ mod tests {
             team,
             player_id: 7,
         }
+    }
+
+    #[test]
+    fn active_air_state_takes_precedence_over_wheel_contact() {
+        let info = CarInfo {
+            idx: 0,
+            team: Team::Blue,
+            config: CarBodyConfig::OCTANE,
+        };
+        let mut state = CarState {
+            wheels_with_contact: [true; 4],
+            is_on_ground: true,
+            is_jumping: true,
+            ..CarState::default()
+        };
+
+        let jumping = car_to_player_info(&info, &state, &player(0, 23)).unwrap();
+        assert_eq!(jumping.air_state, AirState::Jumping);
+
+        state.is_jumping = false;
+        state.is_flipping = true;
+        let dodging = car_to_player_info(&info, &state, &player(0, 23)).unwrap();
+        assert_eq!(dodging.air_state, AirState::Dodging);
+    }
+
+    #[test]
+    fn uses_rocketsim_ground_state_and_resets_dodge_elapsed_on_landing() {
+        let info = CarInfo {
+            idx: 0,
+            team: Team::Blue,
+            config: CarBodyConfig::OCTANE,
+        };
+        let state = CarState {
+            is_on_ground: true,
+            wheels_with_contact: [true, true, true, false],
+            has_flipped: true,
+            flip_time: 0.4,
+            ..CarState::default()
+        };
+
+        let converted = car_to_player_info(&info, &state, &player(0, 23)).unwrap();
+        assert_eq!(converted.air_state, AirState::OnGround);
+        assert_eq!(converted.dodge_elapsed, 0.0);
+    }
+
+    #[test]
+    fn conversion_history_supplies_initial_jump_duration() {
+        let info = CarInfo {
+            idx: 0,
+            team: Team::Blue,
+            config: CarBodyConfig::OCTANE,
+        };
+        let state = CarState {
+            is_on_ground: false,
+            wheels_with_contact: [false; 4],
+            has_jumped: true,
+            jump_time: 0.65,
+            air_time_since_jump: 0.45,
+            ..CarState::default()
+        };
+
+        let conservative = car_to_player_info(&info, &state, &player(0, 23)).unwrap();
+        assert!((conservative.dodge_timeout - 0.8).abs() < 1e-5);
+
+        let converted = car_to_player_info_with_history(
+            &info,
+            &state,
+            &player(0, 23),
+            CarConversionHistory {
+                initial_jump_duration: 0.2,
+                double_jump_active_time: 0.0,
+            },
+        )
+        .unwrap();
+        assert!((converted.dodge_timeout - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn conversion_history_supplies_double_jump_transient() {
+        let info = CarInfo {
+            idx: 0,
+            team: Team::Blue,
+            config: CarBodyConfig::OCTANE,
+        };
+        let state = CarState {
+            is_on_ground: false,
+            has_jumped: true,
+            has_double_jumped: true,
+            ..CarState::default()
+        };
+
+        let converted = car_to_player_info_with_history(
+            &info,
+            &state,
+            &player(0, 23),
+            CarConversionHistory {
+                initial_jump_duration: 0.0,
+                double_jump_active_time: 0.1,
+            },
+        )
+        .unwrap();
+        assert_eq!(converted.air_state, AirState::DoubleJumping);
+    }
+
+    #[test]
+    fn active_dodge_takes_precedence_over_double_jump_history() {
+        let info = CarInfo {
+            idx: 0,
+            team: Team::Blue,
+            config: CarBodyConfig::OCTANE,
+        };
+        let state = CarState {
+            is_on_ground: false,
+            has_double_jumped: true,
+            has_flipped: true,
+            is_flipping: true,
+            ..CarState::default()
+        };
+
+        let converted = car_to_player_info_with_history(
+            &info,
+            &state,
+            &player(0, 23),
+            CarConversionHistory {
+                initial_jump_duration: 0.0,
+                double_jump_active_time: 0.01,
+            },
+        )
+        .unwrap();
+        assert_eq!(converted.air_state, AirState::Dodging);
+    }
+
+    #[test]
+    fn landing_resets_dodge_elapsed_even_when_jump_state_takes_precedence() {
+        let info = CarInfo {
+            idx: 0,
+            team: Team::Blue,
+            config: CarBodyConfig::OCTANE,
+        };
+        let state = CarState {
+            is_on_ground: true,
+            is_jumping: true,
+            has_flipped: true,
+            flip_time: 0.4,
+            ..CarState::default()
+        };
+
+        let converted = car_to_player_info(&info, &state, &player(0, 23)).unwrap();
+        assert_eq!(converted.air_state, AirState::Jumping);
+        assert_eq!(converted.dodge_elapsed, 0.0);
     }
 
     #[test]

@@ -26,6 +26,8 @@ pub enum MatchContextError {
     UnsupportedGameMode(RlbotGameMode),
     #[error("player {player_id} uses unknown car product ID {product_id}")]
     UnknownCarProductId { player_id: i32, product_id: u32 },
+    #[error("MatchConfiguration contains duplicate participant ID {player_id}")]
+    DuplicatePlayerId { player_id: i32 },
     #[error("packet player {player_index} with participant ID {player_id} has an unknown hitbox")]
     UnknownPacketHitbox { player_index: usize, player_id: i32 },
     #[error(
@@ -64,11 +66,18 @@ impl MatchContext {
             );
         }
 
-        let players = match_config
-            .player_configurations
-            .iter()
-            .map(configured_player)
-            .collect::<Result<_, _>>()?;
+        let mut players = Vec::with_capacity(match_config.player_configurations.len());
+        for player in &match_config.player_configurations {
+            if players
+                .iter()
+                .any(|configured: &ConfiguredPlayer| configured.player_id == player.player_id)
+            {
+                return Err(MatchContextError::DuplicatePlayerId {
+                    player_id: player.player_id,
+                });
+            }
+            players.push(configured_player(player)?);
+        }
 
         Ok(Self {
             arena_config,

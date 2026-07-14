@@ -9,8 +9,6 @@ use thiserror::Error;
 use crate::common::{controls_from_rlbot, physics_from_rlbot};
 use crate::match_context::{MatchContext, MatchContextError};
 
-const MAX_FRAME_DELTA: u32 = 120;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnrichedPlayer {
     pub player_index: usize,
@@ -23,6 +21,8 @@ pub enum EnrichmentError {
     MatchContext(#[from] MatchContextError),
     #[error("player at packet index {player_index} has unsupported team index {team}")]
     InvalidTeam { player_index: usize, team: u32 },
+    #[error("RLBot packet contains duplicate participant ID {player_id}")]
+    DuplicatePlayerId { player_id: i32 },
     #[error("expected exactly one RLBot ball, got {count}")]
     BallCount { count: usize },
     #[error("RLBot ball shape {shape} is incompatible with RocketSim mode {mode:?}")]
@@ -37,6 +37,7 @@ struct TrackedPlayer {
     team: Team,
     body_config: CarBodyConfig,
     previous_controls: CarControls,
+    initial_jump_duration: f32,
 }
 
 /// Maintains a RocketSim arena whose cars follow RLBot packets while RocketSim
@@ -48,6 +49,7 @@ pub struct GameStateEnricher {
     match_context: Option<MatchContext>,
     players: Vec<TrackedPlayer>,
     last_frame: Option<u32>,
+    last_phase: Option<MatchPhase>,
 }
 
 impl GameStateEnricher {
@@ -61,6 +63,7 @@ impl GameStateEnricher {
             match_context: None,
             players: Vec::new(),
             last_frame: None,
+            last_phase: None,
         }
     }
 
@@ -75,6 +78,7 @@ impl GameStateEnricher {
             match_context: Some(context),
             players: Vec::new(),
             last_frame: None,
+            last_phase: None,
         }
     }
 
@@ -104,8 +108,28 @@ impl GameStateEnricher {
             .map(|player| self.arena.get_car_state(player.car_index))
     }
 
-    /// Synchronizes packet-authoritative state, advances RocketSim according to
-    /// the RLBot frame delta when gameplay is active, and restores packet values.
+    /// Returns the enriched car state for an RLBot participant ID.
+    #[must_use]
+    pub fn car_state_by_player_id(&self, player_id: i32) -> Option<&CarState> {
+        self.players
+            .iter()
+            .find(|player| player.player_id == player_id)
+            .map(|player| self.arena.get_car_state(player.car_index))
+    }
+
+    /// Returns the retained initial-jump duration for a packet player.
+    #[must_use]
+    pub fn initial_jump_duration(&self, player_index: usize) -> Option<f32> {
+        self.players
+            .get(player_index)
+            .map(|player| player.initial_jump_duration)
+    }
+
+    /// Synchronizes packet-authoritative state, advances RocketSim once to derive
+    /// enrichment for a new active frame, and restores packet values.
+    ///
+    /// Player additions preserve existing history. Departures and immutable car
+    /// changes rebuild the arena because RocketSim does not expose car removal.
     pub fn update(&mut self, packet: &GamePacket) -> Result<Vec<EnrichedPlayer>, EnrichmentError> {
         self.validate_packet(packet)?;
 
@@ -116,8 +140,16 @@ impl GameStateEnricher {
             self.rebuild_arena();
         }
 
-        let reset_history = self.last_frame.is_none() || frame_rollback || layout_changed;
-        let ticks_to_step = self.ticks_to_step(packet, reset_history);
+        let resumed_after_inactive = phase_advances(packet.match_info.match_phase)
+            && self.last_phase.is_some_and(|phase| !phase_advances(phase));
+        let reset_history =
+            self.last_frame.is_none() || frame_rollback || layout_changed || resumed_after_inactive;
+        let ticks_to_step = self.ticks_to_step(packet);
+        if reset_history {
+            for tracked in &mut self.players {
+                tracked.initial_jump_duration = 0.0;
+            }
+        }
         let resolved = self.resolve_players(packet)?;
         self.apply_players(packet, &resolved, reset_history);
         self.sync_ball(packet)?;
@@ -131,6 +163,7 @@ impl GameStateEnricher {
         self.restore_authoritative_boost_pads(packet)?;
         self.restore_authoritative_players(packet);
         self.last_frame = Some(frame);
+        self.last_phase = Some(packet.match_info.match_phase);
 
         Ok(resolved
             .iter()
@@ -151,7 +184,7 @@ impl GameStateEnricher {
         if let [ball] = packet.balls.as_slice() {
             self.validate_ball_shape(ball)?;
         }
-        if !packet.boost_pads.is_empty() && packet.boost_pads.len() != self.arena.num_boost_pads() {
+        if self.match_context.is_some() && packet.boost_pads.len() != self.arena.num_boost_pads() {
             return Err(MatchContextError::BoostPadCountMismatch {
                 packet: packet.boost_pads.len(),
                 arena: self.arena.num_boost_pads(),
@@ -159,6 +192,14 @@ impl GameStateEnricher {
             .into());
         }
         for (player_index, player) in packet.players.iter().enumerate() {
+            if packet.players[..player_index]
+                .iter()
+                .any(|other| other.player_id == player.player_id)
+            {
+                return Err(EnrichmentError::DuplicatePlayerId {
+                    player_id: player.player_id,
+                });
+            }
             team_from_rlbot(player_index, player)?;
             self.body_config_for_player(player_index, player)?;
         }
@@ -197,19 +238,30 @@ impl GameStateEnricher {
     }
 
     fn layout_changed(&self, packet: &GamePacket) -> Result<bool, EnrichmentError> {
-        if packet.players.len() != self.players.len() && !self.players.is_empty() {
+        if self.players.is_empty() {
+            return Ok(false);
+        }
+        if packet.players.len() < self.players.len()
+            || self.players.iter().any(|tracked| {
+                !packet
+                    .players
+                    .iter()
+                    .any(|player| player.player_id == tracked.player_id)
+            })
+        {
             return Ok(true);
         }
         for (index, player) in packet.players.iter().enumerate() {
-            let Some(tracked) = self.players.get(index) else {
+            let Some(tracked) = self
+                .players
+                .iter()
+                .find(|tracked| tracked.player_id == player.player_id)
+            else {
                 continue;
             };
             let team = team_from_rlbot(index, player)?;
             let body = self.body_config_for_player(index, player)?;
-            if tracked.player_id != player.player_id
-                || tracked.team != team
-                || tracked.body_config != body
-            {
+            if tracked.team != team || tracked.body_config != body {
                 return Ok(true);
             }
         }
@@ -220,52 +272,52 @@ impl GameStateEnricher {
         self.arena = Arena::new_with_config(self.arena_config.clone());
         self.players.clear();
         self.last_frame = None;
+        self.last_phase = None;
     }
 
-    fn ticks_to_step(&self, packet: &GamePacket, reset_history: bool) -> u32 {
-        if !phase_advances(packet.match_info.match_phase) {
-            return 0;
-        }
-        if reset_history {
-            return 1;
-        }
-        let Some(last_frame) = self.last_frame else {
-            return 1;
-        };
-        packet
-            .match_info
-            .frame_num
-            .saturating_sub(last_frame)
-            .min(MAX_FRAME_DELTA)
+    fn ticks_to_step(&self, packet: &GamePacket) -> u32 {
+        u32::from(
+            phase_advances(packet.match_info.match_phase)
+                && self.last_frame != Some(packet.match_info.frame_num),
+        )
     }
 
     fn resolve_players(
         &mut self,
         packet: &GamePacket,
     ) -> Result<Vec<ResolvedPlayer>, EnrichmentError> {
-        let mut resolved = Vec::with_capacity(packet.players.len());
+        let mut ordered_players = Vec::with_capacity(packet.players.len());
         for (index, player) in packet.players.iter().enumerate() {
             let team = team_from_rlbot(index, player)?;
             let body_config = self.body_config_for_player(index, player)?;
-            let car_index = if let Some(tracked) = self.players.get(index) {
-                tracked.car_index
+            let tracked = if let Some(position) = self
+                .players
+                .iter()
+                .position(|tracked| tracked.player_id == player.player_id)
+            {
+                self.players.remove(position)
             } else {
-                let car_index = self.arena.add_car(team, body_config);
-                self.players.push(TrackedPlayer {
-                    car_index,
+                TrackedPlayer {
+                    car_index: self.arena.add_car(team, body_config),
                     player_id: player.player_id,
                     team,
                     body_config,
                     previous_controls: CarControls::default(),
-                });
-                car_index
+                    initial_jump_duration: 0.0,
+                }
             };
-            resolved.push(ResolvedPlayer {
-                car_index,
-                previous_controls: self.players[index].previous_controls,
-            });
+            ordered_players.push(tracked);
         }
-        Ok(resolved)
+        self.players = ordered_players;
+        Ok(self
+            .players
+            .iter()
+            .map(|tracked| ResolvedPlayer {
+                car_index: tracked.car_index,
+                previous_controls: tracked.previous_controls,
+                initial_jump_duration: tracked.initial_jump_duration,
+            })
+            .collect())
     }
 
     fn apply_players(
@@ -281,20 +333,38 @@ impl GameStateEnricher {
             } else {
                 resolved.previous_controls
             };
-            let state =
-                merge_authoritative_player(player, previous, previous_controls, reset_history);
+            let state = merge_authoritative_player(
+                player,
+                previous,
+                previous_controls,
+                resolved.initial_jump_duration,
+                reset_history,
+            );
             self.arena.set_car_state(resolved.car_index, state);
             self.arena
                 .set_car_controls(resolved.car_index, state.controls);
             self.players[index].previous_controls = controls_from_rlbot(player.last_input);
+            if player.air_state == AirState::Jumping {
+                self.players[index].initial_jump_duration =
+                    state.jump_time.clamp(0.0, consts::car::jump::MAX_TIME);
+            } else if !player.has_jumped {
+                self.players[index].initial_jump_duration = 0.0;
+            }
         }
     }
 
     fn restore_authoritative_players(&mut self, packet: &GamePacket) {
         for (index, player) in packet.players.iter().enumerate() {
             let car_index = self.players[index].car_index;
-            let mut state = *self.arena.get_car_state(car_index);
-            restore_authoritative_player(player, &mut state);
+            let mut simulated = *self.arena.get_car_state(car_index);
+            simulated.is_on_ground = simulated.num_wheels_in_contact() >= 3;
+            let mut state = simulated;
+            restore_authoritative_player(
+                player,
+                &mut state,
+                self.players[index].initial_jump_duration,
+            );
+            preserve_simulated_contacts(simulated, &mut state);
             self.arena.set_car_state(car_index, state);
         }
     }
@@ -357,6 +427,7 @@ impl GameStateEnricher {
 struct ResolvedPlayer {
     car_index: usize,
     previous_controls: CarControls,
+    initial_jump_duration: f32,
 }
 
 fn phase_advances(phase: MatchPhase) -> bool {
@@ -383,10 +454,21 @@ fn apply_boost_pads(arena: &mut Arena, packet: &GamePacket) -> Result<(), Enrich
         .into());
     }
     for (index, pad) in packet.boost_pads.iter().enumerate() {
+        let config = arena.get_boost_pad_config(index);
+        let max_cooldown = if config.is_big {
+            arena.mutator_config().boost_pad_cooldown_big
+        } else {
+            arena.mutator_config().boost_pad_cooldown_small
+        };
         arena.set_boost_pad_state(
             index,
             BoostPadState {
-                cooldown: if pad.is_active { 0.0 } else { pad.timer },
+                // RLBot reports elapsed time since pickup; RocketSim stores time remaining.
+                cooldown: if pad.is_active {
+                    0.0
+                } else {
+                    (max_cooldown - pad.timer).clamp(0.0, max_cooldown)
+                },
             },
         );
     }
@@ -405,57 +487,101 @@ fn merge_authoritative_player(
     player: &PlayerInfo,
     mut state: CarState,
     previous_controls: CarControls,
+    initial_jump_duration: f32,
     reset_history: bool,
 ) -> CarState {
     let controls = controls_from_rlbot(player.last_input);
-    let is_on_ground = player.air_state == AirState::OnGround;
 
-    restore_authoritative_player(player, &mut state);
+    restore_authoritative_player(player, &mut state, initial_jump_duration);
     state.prev_controls = previous_controls;
 
     if reset_history {
         state.prev_controls = controls;
-        state.wheels_with_contact = if is_on_ground { [true; 4] } else { [false; 4] };
-        state.world_contact_normal = None;
+        // AirState describes jump/dodge forces, not wheel contact. Leave contact
+        // fields under RocketSim's control so its collision state can establish them.
         state.air_time = 0.0;
         state.jump_time = 0.0;
+        state.is_boosting = false;
         state.boosting_time = 0.0;
         state.time_since_boosted = 0.0;
-        state.handbrake_val = f32::from(controls.handbrake);
+        state.handbrake_val = 0.0;
     }
 
     state
 }
 
-fn restore_authoritative_player(player: &PlayerInfo, state: &mut CarState) {
+fn preserve_simulated_contacts(simulated: CarState, state: &mut CarState) {
+    if state.is_demoed {
+        state.is_on_ground = false;
+        state.wheels_with_contact = [false; 4];
+        state.world_contact_normal = None;
+    } else {
+        state.is_on_ground = simulated.is_on_ground;
+        state.wheels_with_contact = simulated.wheels_with_contact;
+        state.world_contact_normal = simulated.world_contact_normal;
+    }
+}
+
+fn restore_authoritative_player(
+    player: &PlayerInfo,
+    state: &mut CarState,
+    initial_jump_duration: f32,
+) {
+    let controls = controls_from_rlbot(player.last_input);
     state.phys = physics_from_rlbot(player.physics);
-    state.controls = controls_from_rlbot(player.last_input);
-    state.is_on_ground = player.air_state == AirState::OnGround;
+    state.controls = controls;
     state.has_jumped = player.has_jumped;
     state.has_double_jumped = player.has_double_jumped;
     state.has_flipped = player.has_dodged;
     state.flip_rel_torque = Vec3A::new(-player.dodge_dir.y, player.dodge_dir.x, 0.0);
-    state.flip_time = player.dodge_elapsed.max(0.0);
     state.is_flipping = player.air_state == AirState::Dodging;
-    state.is_jumping = player.air_state == AirState::Jumping;
-    state.air_time_since_jump = if player.dodge_timeout >= 0.0 {
-        (consts::car::jump::DOUBLEJUMP_MAX_DELAY - player.dodge_timeout)
-            .clamp(0.0, consts::car::jump::DOUBLEJUMP_MAX_DELAY)
-    } else if player.has_jumped {
-        consts::car::jump::DOUBLEJUMP_MAX_DELAY
+    state.flip_time = if state.is_flipping || player.has_dodged {
+        player.dodge_elapsed.max(0.0)
     } else {
         0.0
     };
-    state.boost = player.boost;
+    state.is_jumping = player.air_state == AirState::Jumping;
+    if player.air_state == AirState::DoubleJumping {
+        // RocketSim represents the double-jump impulse only through the persistent
+        // consumed flag; it has no equivalent 13-tick active-state discriminator.
+        state.has_double_jumped = true;
+        state.is_jumping = false;
+        state.is_flipping = false;
+    }
+    if state.is_jumping {
+        // RLBot does not expose elapsed initial-jump time. Keep RocketSim's estimate while
+        // the state is continuous, bounded by the documented maximum hold duration.
+        state.jump_time = state.jump_time.clamp(0.0, consts::car::jump::MAX_TIME);
+        state.air_time_since_jump = 0.0;
+    } else {
+        state.jump_time = 0.0;
+        if !player.has_jumped {
+            state.air_time_since_jump = 0.0;
+        } else if player.dodge_timeout >= 0.0 {
+            state.air_time_since_jump = (consts::car::jump::DOUBLEJUMP_MAX_DELAY
+                + initial_jump_duration.clamp(0.0, consts::car::jump::MAX_TIME)
+                - player.dodge_timeout)
+                .clamp(0.0, consts::car::jump::DOUBLEJUMP_MAX_DELAY);
+        } else {
+            state.air_time_since_jump = consts::car::jump::DOUBLEJUMP_MAX_DELAY;
+        }
+    }
+    state.boost = player.boost.clamp(0.0, 100.0);
     state.is_supersonic = player.is_supersonic;
-    state.is_demoed = player.demolished_timeout > 0.0;
-    state.demo_respawn_timer = player.demolished_timeout.max(0.0);
+    state.is_demoed = player.demolished_timeout != -1.0;
+    state.demo_respawn_timer = if state.is_demoed {
+        player.demolished_timeout.max(0.0)
+    } else {
+        0.0
+    };
 }
 
 #[cfg(test)]
 mod tests {
-    use rlbot::flat::{GamePacket, MatchPhase, Physics, PlayerInfo, Vector3};
-    use rocketsim::{Arena, CarBodyConfig, GameMode};
+    use rlbot::flat::{
+        BoostPadState as RlbotBoostPadState, GamePacket, MatchPhase, Physics, PlayerInfo, Vector3,
+    };
+    use rocketsim::{Arena, CarBodyConfig, GameMode, init_from_default};
 
     use super::*;
 
@@ -508,18 +634,78 @@ mod tests {
     }
 
     #[test]
-    fn packet_index_is_the_canonical_car_identity() {
+    fn player_id_preserves_identity_when_packet_order_changes() {
         let arena = Arena::new(GameMode::TheVoid);
         let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::default());
-        let mut packet = packet(1, player());
-        packet.players.push(player());
-        packet.players[1].physics.location.x = 999.0;
+        let mut first_packet = packet(1, player());
+        let mut second_player = player();
+        second_player.player_id = 99;
+        second_player.physics.location.x = 999.0;
+        first_packet.players.push(second_player.clone());
 
-        let mappings = enricher.update(&packet).unwrap();
+        let first = enricher.update(&first_packet).unwrap();
+        let first_car = first[0].car_index;
+        let second_car = first[1].car_index;
+        let mut first_state = *enricher.arena().get_car_state(first_car);
+        first_state.handbrake_val = 0.25;
+        enricher.arena_mut().set_car_state(first_car, first_state);
+        let mut second_state = *enricher.arena().get_car_state(second_car);
+        second_state.handbrake_val = 0.75;
+        enricher.arena_mut().set_car_state(second_car, second_state);
 
-        assert_eq!(mappings[0].car_index, 0);
-        assert_eq!(mappings[1].car_index, 1);
-        assert_eq!(enricher.car_state(1).unwrap().phys.pos.x, 999.0);
+        let mut reordered = GamePacket::default();
+        reordered.match_info.frame_num = 2;
+        reordered.match_info.match_phase = MatchPhase::Paused;
+        reordered.players.push(second_player);
+        reordered.players.push(player());
+        let mappings = enricher.update(&reordered).unwrap();
+
+        assert_eq!(mappings[0].car_index, second_car);
+        assert_eq!(mappings[1].car_index, first_car);
+        assert_eq!(enricher.car_state(0).unwrap().handbrake_val, 0.75);
+        assert_eq!(enricher.car_state(1).unwrap().handbrake_val, 0.25);
+        assert_eq!(
+            enricher.car_state_by_player_id(42).unwrap().phys.pos.x,
+            123.0
+        );
+        assert_eq!(enricher.arena().num_cars(), 2);
+    }
+
+    #[test]
+    fn joining_player_preserves_existing_player_history() {
+        let arena = Arena::new(GameMode::TheVoid);
+        let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::default());
+        enricher.update(&packet(1, player())).unwrap();
+        let mut state = *enricher.car_state(0).unwrap();
+        state.handbrake_val = 0.5;
+        enricher.arena_mut().set_car_state(0, state);
+
+        let mut joined = packet(2, player());
+        joined.match_info.match_phase = MatchPhase::Paused;
+        let mut newcomer = player();
+        newcomer.player_id = 99;
+        joined.players.push(newcomer);
+        enricher.update(&joined).unwrap();
+
+        assert_eq!(enricher.arena().num_cars(), 2);
+        assert_eq!(
+            enricher.car_state_by_player_id(42).unwrap().handbrake_val,
+            0.5
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_player_ids() {
+        let arena = Arena::new(GameMode::TheVoid);
+        let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::default());
+        let mut duplicate = packet(1, player());
+        duplicate.players.push(player());
+
+        assert_eq!(
+            enricher.update(&duplicate),
+            Err(EnrichmentError::DuplicatePlayerId { player_id: 42 })
+        );
+        assert_eq!(enricher.arena().num_cars(), 0);
     }
 
     #[test]
@@ -551,20 +737,105 @@ mod tests {
     }
 
     #[test]
-    fn frame_gaps_advance_rocketsim_with_a_bound() {
+    fn frame_gaps_probe_only_the_current_packet_once() {
         let arena = Arena::new(GameMode::TheVoid);
         let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::default());
         enricher.update(&packet(1, player())).unwrap();
         let tick = enricher.arena().tick_count();
 
         enricher.update(&packet(5, player())).unwrap();
-        assert_eq!(enricher.arena().tick_count(), tick + 4);
+        assert_eq!(enricher.arena().tick_count(), tick + 1);
 
         enricher.update(&packet(1_000, player())).unwrap();
-        assert_eq!(
-            enricher.arena().tick_count(),
-            tick + 4 + MAX_FRAME_DELTA as u64
-        );
+        assert_eq!(enricher.arena().tick_count(), tick + 2);
+    }
+
+    #[test]
+    fn resuming_after_pause_resets_history() {
+        let arena = Arena::new(GameMode::TheVoid);
+        let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::default());
+        let mut active = player();
+        active.last_input.handbrake = true;
+        enricher.update(&packet(1, active)).unwrap();
+
+        let mut paused = packet(2, player());
+        paused.match_info.match_phase = MatchPhase::Paused;
+        enricher.update(&paused).unwrap();
+
+        let resumed = packet(3, player());
+        enricher.update(&resumed).unwrap();
+        assert_eq!(enricher.car_state(0).unwrap().handbrake_val, 0.0);
+    }
+
+    #[test]
+    fn resume_discards_stale_initial_jump_duration() {
+        let arena = Arena::new(GameMode::TheVoid);
+        let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::default());
+        let mut jumping = player();
+        jumping.air_state = AirState::Jumping;
+        jumping.has_jumped = true;
+        jumping.last_input.jump = true;
+        for frame in 1..=12 {
+            enricher.update(&packet(frame, jumping.clone())).unwrap();
+        }
+        assert!(enricher.initial_jump_duration(0).unwrap() > 0.0);
+
+        let mut paused = packet(13, jumping.clone());
+        paused.match_info.match_phase = MatchPhase::Paused;
+        enricher.update(&paused).unwrap();
+
+        let mut resumed = jumping;
+        resumed.air_state = AirState::InAir;
+        resumed.last_input.jump = false;
+        resumed.dodge_timeout = 1.0;
+        enricher.update(&packet(14, resumed)).unwrap();
+
+        assert_eq!(enricher.initial_jump_duration(0), Some(0.0));
+        assert!((enricher.car_state(0).unwrap().air_time_since_jump - 0.25).abs() < 1e-5);
+    }
+
+    #[test]
+    fn reconstructs_post_jump_time_from_retained_initial_jump_duration() {
+        let arena = Arena::new(GameMode::TheVoid);
+        let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::default());
+        let mut jumping = player();
+        jumping.air_state = AirState::Jumping;
+        jumping.has_jumped = true;
+        jumping.last_input.jump = true;
+
+        for frame in 1..=12 {
+            enricher.update(&packet(frame, jumping.clone())).unwrap();
+        }
+
+        let initial_jump_duration = enricher.players[0].initial_jump_duration;
+        assert!(initial_jump_duration > 0.0);
+
+        let mut airborne = jumping;
+        airborne.air_state = AirState::InAir;
+        airborne.last_input.jump = false;
+        airborne.dodge_timeout =
+            consts::car::jump::DOUBLEJUMP_MAX_DELAY + initial_jump_duration - 0.05;
+        enricher.update(&packet(13, airborne)).unwrap();
+
+        let state = enricher.car_state(0).unwrap();
+        assert_eq!(state.jump_time, 0.0);
+        assert!((state.air_time_since_jump - 0.05).abs() < 1e-5);
+    }
+
+    #[test]
+    fn double_jumping_consumes_the_rocketsim_double_jump() {
+        let arena = Arena::new(GameMode::TheVoid);
+        let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::default());
+        let mut double_jumping = player();
+        double_jumping.air_state = AirState::DoubleJumping;
+        double_jumping.has_jumped = true;
+        double_jumping.has_double_jumped = true;
+
+        enricher.update(&packet(1, double_jumping)).unwrap();
+        let state = enricher.car_state(0).unwrap();
+        assert!(state.has_double_jumped);
+        assert!(!state.is_jumping);
+        assert!(!state.is_flipping);
     }
 
     #[test]
@@ -577,6 +848,79 @@ mod tests {
         assert_eq!(snapshot.num_cars(), 1);
         assert_eq!(snapshot.cars[0].0.idx, 0);
         assert_eq!(snapshot.ball.phys.pos, enricher.ball_state().phys.pos);
+    }
+
+    #[test]
+    fn converts_elapsed_rlbot_boost_timer_to_remaining_cooldown() {
+        init_from_default(true).unwrap();
+        let arena = Arena::new(GameMode::Soccar);
+        let max_cooldown = arena.mutator_config().boost_pad_cooldown_big;
+        let big_pad = (0..arena.num_boost_pads())
+            .find(|&index| arena.get_boost_pad_config(index).is_big)
+            .unwrap();
+        let mut packet = GamePacket {
+            boost_pads: (0..arena.num_boost_pads())
+                .map(|_| RlbotBoostPadState {
+                    is_active: true,
+                    timer: 0.0,
+                })
+                .collect(),
+            ..GamePacket::default()
+        };
+        packet.boost_pads[big_pad] = RlbotBoostPadState {
+            is_active: false,
+            timer: 2.5,
+        };
+        let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::default());
+
+        enricher.update(&packet).unwrap();
+
+        assert_eq!(
+            enricher.arena().get_boost_pad_state(big_pad).cooldown,
+            max_cooldown - 2.5
+        );
+    }
+
+    #[test]
+    fn demolished_players_do_not_retain_contacts() {
+        let arena = Arena::new(GameMode::TheVoid);
+        let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::default());
+        enricher.update(&packet(1, player())).unwrap();
+        let mut prior = *enricher.car_state(0).unwrap();
+        prior.is_on_ground = true;
+        prior.wheels_with_contact = [true; 4];
+        prior.world_contact_normal = Some(Vec3A::Z);
+        enricher.arena_mut().set_car_state(0, prior);
+
+        let mut demoed = player();
+        demoed.demolished_timeout = 2.0;
+        enricher.update(&packet(2, demoed)).unwrap();
+        let state = enricher.car_state(0).unwrap();
+        assert!(state.is_demoed);
+        assert!(!state.is_on_ground);
+        assert_eq!(state.wheels_with_contact, [false; 4]);
+        assert_eq!(state.world_contact_normal, None);
+    }
+
+    #[test]
+    fn rlbot_air_and_demo_states_follow_their_documented_meaning() {
+        let arena = Arena::new(GameMode::TheVoid);
+        let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::default());
+        let mut jumping = player();
+        jumping.air_state = AirState::Jumping;
+        jumping.has_jumped = true;
+        jumping.dodge_elapsed = 4.0;
+        jumping.demolished_timeout = 0.0;
+
+        enricher.update(&packet(1, jumping)).unwrap();
+        let state = enricher.car_state(0).unwrap();
+
+        assert!(!state.is_on_ground);
+        assert!(state.is_jumping);
+        assert_eq!(state.air_time_since_jump, 0.0);
+        assert_eq!(state.flip_time, 0.0);
+        assert!(state.is_demoed);
+        assert_eq!(state.demo_respawn_timer, 0.0);
     }
 
     #[test]

@@ -9,3 +9,4 @@ pub use from_rlbot::{EnrichedPlayer, EnrichmentError, GameStateEnricher};
 pub use match_context::{MatchContext, MatchContextError};
 pub use rlbot;
 pub use rocketsim;
+pub use to_rlbot::CarConversionHistory;

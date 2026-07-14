@@ -3,7 +3,7 @@ use rlbot_rocketsim::rlbot::flat::{AirState, GamePacket, Physics, PlayerInfo, Ve
 use rlbot_rocketsim::rocketsim::{Arena, CarBodyConfig, GameMode, init_from_default};
 
 #[test]
-fn enriches_wheel_contacts_in_soccar() {
+fn derives_no_wheel_contacts_instead_of_copying_ground_air_state() {
     init_from_default(true).unwrap();
 
     let arena = Arena::new(GameMode::Soccar);
@@ -15,7 +15,7 @@ fn enriches_wheel_contacts_in_soccar() {
             location: Vector3 {
                 x: 0.0,
                 y: -2_000.0,
-                z: 17.0,
+                z: 1_000.0,
             },
             ..Physics::default()
         },
@@ -29,8 +29,45 @@ fn enriches_wheel_contacts_in_soccar() {
     packet.players.push(player);
 
     enricher.update(&packet).unwrap();
+    let state = enricher.car_state(0).unwrap();
+    assert_eq!(state.wheels_with_contact, [false; 4]);
+    assert!(!state.is_on_ground);
+    assert_eq!(state.phys.pos.z, 1_000.0);
+}
+
+#[test]
+fn derives_ground_state_from_wheel_contacts_despite_in_air_state() {
+    init_from_default(true).unwrap();
+
+    let arena = Arena::new(GameMode::Soccar);
+    let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::OCTANE);
+    let player = PlayerInfo {
+        player_id: 7,
+        team: 0,
+        physics: Physics {
+            location: Vector3 {
+                x: 0.0,
+                y: -2_000.0,
+                z: 17.0,
+            },
+            ..Physics::default()
+        },
+        air_state: AirState::InAir,
+        dodge_timeout: -1.0,
+        demolished_timeout: -1.0,
+        ..PlayerInfo::default()
+    };
+
+    for frame in 1..=2 {
+        let mut packet = GamePacket::default();
+        packet.match_info.frame_num = frame;
+        packet.match_info.match_phase = rlbot_rocketsim::rlbot::flat::MatchPhase::Active;
+        packet.players.push(player.clone());
+        enricher.update(&packet).unwrap();
+    }
 
     let state = enricher.car_state(0).unwrap();
     assert_eq!(state.wheels_with_contact, [true; 4]);
+    assert!(state.is_on_ground);
     assert_eq!(state.phys.pos.z, 17.0);
 }
