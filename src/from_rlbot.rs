@@ -8,6 +8,7 @@ use thiserror::Error;
 
 use crate::common::{controls_from_rlbot, physics_from_rlbot};
 use crate::match_context::{MatchContext, MatchContextError};
+use crate::to_rlbot::CarConversionHistory;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnrichedPlayer {
@@ -38,7 +39,7 @@ struct TrackedPlayer {
     body_config: CarBodyConfig,
     previous_controls: CarControls,
     initial_jump_duration: f32,
-    double_jump_active_time: f32,
+    double_jump_active: bool,
     flip_reset_available: bool,
 }
 
@@ -119,12 +120,29 @@ impl GameStateEnricher {
             .map(|player| self.arena.get_car_state(player.car_index))
     }
 
+    /// Returns the conversion history for a packet player.
+    #[must_use]
+    pub fn car_conversion_history(&self, player_index: usize) -> Option<CarConversionHistory> {
+        self.players.get(player_index).map(car_conversion_history)
+    }
+
+    /// Returns the conversion history for an RLBot participant ID.
+    #[must_use]
+    pub fn car_conversion_history_by_player_id(
+        &self,
+        player_id: i32,
+    ) -> Option<CarConversionHistory> {
+        self.players
+            .iter()
+            .find(|player| player.player_id == player_id)
+            .map(car_conversion_history)
+    }
+
     /// Returns the retained initial-jump duration for a packet player.
     #[must_use]
     pub fn initial_jump_duration(&self, player_index: usize) -> Option<f32> {
-        self.players
-            .get(player_index)
-            .map(|player| player.initial_jump_duration)
+        self.car_conversion_history(player_index)
+            .map(|history| history.initial_jump_duration)
     }
 
     /// Synchronizes packet-authoritative state, advances RocketSim once to derive
@@ -158,7 +176,7 @@ impl GameStateEnricher {
         if reset_history {
             for tracked in &mut self.players {
                 tracked.initial_jump_duration = 0.0;
-                tracked.double_jump_active_time = 0.0;
+                tracked.double_jump_active = false;
                 tracked.flip_reset_available = false;
             }
         }
@@ -317,7 +335,7 @@ impl GameStateEnricher {
                     body_config,
                     previous_controls: CarControls::default(),
                     initial_jump_duration: 0.0,
-                    double_jump_active_time: 0.0,
+                    double_jump_active: false,
                     flip_reset_available: false,
                 }
             };
@@ -373,17 +391,11 @@ impl GameStateEnricher {
             } else if !player.has_jumped {
                 self.players[index].initial_jump_duration = 0.0;
             }
-            self.players[index].double_jump_active_time =
-                if player.air_state == AirState::DoubleJumping {
-                    consts::TICK_TIME * 13.0
-                } else {
-                    0.0
-                };
-            self.players[index].flip_reset_available = !player.has_jumped
+            self.players[index].double_jump_active = player.air_state == AirState::DoubleJumping;
+            self.players[index].flip_reset_available = player.air_state == AirState::InAir
+                && !player.has_jumped
                 && !player.has_double_jumped
-                && !player.has_dodged
-                && player.dodge_timeout < 0.0
-                && player.air_state != AirState::OnGround;
+                && !player.has_dodged;
         }
     }
 
@@ -431,6 +443,14 @@ struct ResolvedPlayer {
     previous_controls: CarControls,
     initial_jump_duration: f32,
     flip_reset_available: bool,
+}
+
+fn car_conversion_history(player: &TrackedPlayer) -> CarConversionHistory {
+    CarConversionHistory {
+        initial_jump_duration: player.initial_jump_duration,
+        double_jump_active: player.double_jump_active,
+        flip_reset_available: player.flip_reset_available,
+    }
 }
 
 fn phase_advances(phase: MatchPhase) -> bool {

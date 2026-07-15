@@ -1,8 +1,10 @@
 use rlbot_rocketsim::GameStateEnricher;
 use rlbot_rocketsim::rlbot::flat::{
-    AirState, GamePacket, MatchPhase, Physics, PlayerInfo, Vector3,
+    AirState, CustomBot, GamePacket, MatchPhase, Physics, PlayerClass, PlayerConfiguration,
+    PlayerInfo, PlayerLoadout, Vector3,
 };
-use rlbot_rocketsim::rocketsim::{Arena, CarBodyConfig, GameMode};
+use rlbot_rocketsim::rocketsim::{Arena, CarBodyConfig, GameMode, Team};
+use rlbot_rocketsim::to_rlbot::car_to_player_info_with_history;
 
 const TICK_TIME: f32 = 1.0 / 120.0;
 
@@ -34,6 +36,34 @@ fn packet(frame: u32, phase: MatchPhase, players: Vec<PlayerInfo>) -> GamePacket
         }),
         ..Default::default()
     }
+}
+
+fn player_config(player_id: i32) -> PlayerConfiguration {
+    PlayerConfiguration {
+        variety: PlayerClass::CustomBot(Box::new(CustomBot {
+            loadout: Some(Box::new(PlayerLoadout {
+                car_id: 23,
+                ..PlayerLoadout::default()
+            })),
+            ..CustomBot::default()
+        })),
+        team: Team::Blue as u32,
+        player_id,
+    }
+}
+
+fn converted_air_state(enricher: &GameStateEnricher, player_id: i32) -> AirState {
+    let (info, state) = enricher.arena().get_car_info_and_state(0);
+    car_to_player_info_with_history(
+        info,
+        state,
+        &player_config(player_id),
+        enricher
+            .car_conversion_history_by_player_id(player_id)
+            .unwrap(),
+    )
+    .unwrap()
+    .air_state
 }
 
 #[test]
@@ -80,6 +110,111 @@ fn jump_hold_release_and_double_jump_sequence() {
     assert!(state.has_double_jumped);
     assert!(!state.is_jumping);
     assert!(!state.is_flipping);
+
+    assert!(
+        enricher
+            .car_conversion_history(0)
+            .unwrap()
+            .double_jump_active
+    );
+    assert_eq!(converted_air_state(&enricher, 7), AirState::DoubleJumping);
+}
+
+#[test]
+fn authoritative_double_jump_transition_clears_active_history() {
+    let arena = Arena::new(GameMode::TheVoid);
+    let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::OCTANE);
+    let mut double_jumping = player(7);
+    double_jumping.air_state = AirState::DoubleJumping;
+    double_jumping.has_jumped = true;
+    double_jumping.has_double_jumped = true;
+
+    enricher
+        .update(&packet(1, MatchPhase::Active, vec![double_jumping.clone()]))
+        .unwrap();
+    assert!(
+        enricher
+            .car_conversion_history(0)
+            .unwrap()
+            .double_jump_active
+    );
+    assert_eq!(converted_air_state(&enricher, 7), AirState::DoubleJumping);
+
+    double_jumping.air_state = AirState::InAir;
+    enricher
+        .update(&packet(2, MatchPhase::Active, vec![double_jumping]))
+        .unwrap();
+    assert!(
+        !enricher
+            .car_conversion_history(0)
+            .unwrap()
+            .double_jump_active
+    );
+    assert_eq!(converted_air_state(&enricher, 7), AirState::InAir);
+}
+
+#[test]
+fn authoritative_double_jump_state_ignores_packet_gap_and_pause() {
+    let arena = Arena::new(GameMode::TheVoid);
+    let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::OCTANE);
+    let mut double_jumping = player(7);
+    double_jumping.air_state = AirState::DoubleJumping;
+    double_jumping.has_jumped = true;
+    double_jumping.has_double_jumped = true;
+
+    enricher
+        .update(&packet(1, MatchPhase::Active, vec![double_jumping.clone()]))
+        .unwrap();
+    enricher
+        .update(&packet(
+            1_000,
+            MatchPhase::Paused,
+            vec![double_jumping.clone()],
+        ))
+        .unwrap();
+    assert!(
+        enricher
+            .car_conversion_history_by_player_id(7)
+            .unwrap()
+            .double_jump_active
+    );
+    assert_eq!(converted_air_state(&enricher, 7), AirState::DoubleJumping);
+
+    double_jumping.air_state = AirState::InAir;
+    enricher
+        .update(&packet(2_000, MatchPhase::Active, vec![double_jumping]))
+        .unwrap();
+    assert!(
+        !enricher
+            .car_conversion_history(0)
+            .unwrap()
+            .double_jump_active
+    );
+    assert_eq!(converted_air_state(&enricher, 7), AirState::InAir);
+}
+
+#[test]
+fn airborne_reset_with_default_timeout_retains_untimed_history() {
+    let arena = Arena::new(GameMode::TheVoid);
+    let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::OCTANE);
+    let mut reset = player(7);
+    reset.dodge_timeout = 0.0;
+    reset.air_state = AirState::InAir;
+
+    enricher
+        .update(&packet(1, MatchPhase::Active, vec![reset]))
+        .unwrap();
+
+    let (info, state) = enricher.arena().get_car_info_and_state(0);
+    let converted = car_to_player_info_with_history(
+        info,
+        state,
+        &player_config(7),
+        enricher.car_conversion_history_by_player_id(7).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(converted.air_state, AirState::InAir);
+    assert_eq!(converted.dodge_timeout, -1.0);
 }
 
 #[test]
