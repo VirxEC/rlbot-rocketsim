@@ -33,6 +33,8 @@ pub struct CarConversionHistory {
     pub initial_jump_duration: f32,
     /// Seconds remaining in RLBot's active 13-tick double-jump state.
     pub double_jump_active_time: f32,
+    /// Whether an airborne player has an untimed RLBot flip reset available.
+    pub flip_reset_available: bool,
 }
 
 pub trait CarInfoExt {
@@ -130,6 +132,7 @@ pub fn car_to_player_info_with_history(
         + initial_jump_duration
         - state.air_time_since_jump;
     let dodge_timeout = if air_state == AirState::OnGround
+        || history.flip_reset_available
         || !state.has_jumped
         || state.has_double_jumped
         || state.has_flipped
@@ -317,6 +320,7 @@ mod tests {
             CarConversionHistory {
                 initial_jump_duration: 0.2,
                 double_jump_active_time: 0.0,
+                flip_reset_available: false,
             },
         )
         .unwrap();
@@ -345,6 +349,7 @@ mod tests {
             CarConversionHistory {
                 initial_jump_duration: 0.1,
                 double_jump_active_time: 0.0,
+                flip_reset_available: false,
             },
         )
         .unwrap();
@@ -372,6 +377,7 @@ mod tests {
             CarConversionHistory {
                 initial_jump_duration: 0.2,
                 double_jump_active_time: 0.0,
+                flip_reset_available: false,
             },
         )
         .unwrap();
@@ -399,6 +405,7 @@ mod tests {
             CarConversionHistory {
                 initial_jump_duration: 0.0,
                 double_jump_active_time: 0.1,
+                flip_reset_available: false,
             },
         )
         .unwrap();
@@ -427,6 +434,7 @@ mod tests {
             CarConversionHistory {
                 initial_jump_duration: 0.0,
                 double_jump_active_time: 0.01,
+                flip_reset_available: false,
             },
         )
         .unwrap();

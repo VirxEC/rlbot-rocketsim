@@ -38,6 +38,8 @@ struct TrackedPlayer {
     body_config: CarBodyConfig,
     previous_controls: CarControls,
     initial_jump_duration: f32,
+    double_jump_active_time: f32,
+    flip_reset_available: bool,
 }
 
 /// Maintains a RocketSim arena whose cars follow RLBot packets while RocketSim
@@ -156,6 +158,8 @@ impl GameStateEnricher {
         if reset_history {
             for tracked in &mut self.players {
                 tracked.initial_jump_duration = 0.0;
+                tracked.double_jump_active_time = 0.0;
+                tracked.flip_reset_available = false;
             }
         }
         let resolved = self.resolve_players(packet)?;
@@ -313,6 +317,8 @@ impl GameStateEnricher {
                     body_config,
                     previous_controls: CarControls::default(),
                     initial_jump_duration: 0.0,
+                    double_jump_active_time: 0.0,
+                    flip_reset_available: false,
                 }
             };
             ordered_players.push(tracked);
@@ -325,6 +331,7 @@ impl GameStateEnricher {
                 car_index: tracked.car_index,
                 previous_controls: tracked.previous_controls,
                 initial_jump_duration: tracked.initial_jump_duration,
+                flip_reset_available: tracked.flip_reset_available,
             })
             .collect())
     }
@@ -351,6 +358,7 @@ impl GameStateEnricher {
                 simulated,
                 previous_controls,
                 resolved.initial_jump_duration,
+                resolved.flip_reset_available,
                 reset_history,
             );
             let mut state = state;
@@ -365,6 +373,17 @@ impl GameStateEnricher {
             } else if !player.has_jumped {
                 self.players[index].initial_jump_duration = 0.0;
             }
+            self.players[index].double_jump_active_time =
+                if player.air_state == AirState::DoubleJumping {
+                    consts::TICK_TIME * 13.0
+                } else {
+                    0.0
+                };
+            self.players[index].flip_reset_available = !player.has_jumped
+                && !player.has_double_jumped
+                && !player.has_dodged
+                && player.dodge_timeout < 0.0
+                && player.air_state != AirState::OnGround;
         }
     }
 
@@ -411,6 +430,7 @@ struct ResolvedPlayer {
     car_index: usize,
     previous_controls: CarControls,
     initial_jump_duration: f32,
+    flip_reset_available: bool,
 }
 
 fn phase_advances(phase: MatchPhase) -> bool {
@@ -471,11 +491,17 @@ fn merge_authoritative_player(
     mut state: CarState,
     previous_controls: CarControls,
     initial_jump_duration: f32,
+    flip_reset_available: bool,
     reset_history: bool,
 ) -> CarState {
     let controls = controls_from_rlbot(player.last_input);
 
-    restore_authoritative_player(player, &mut state, initial_jump_duration);
+    restore_authoritative_player(
+        player,
+        &mut state,
+        initial_jump_duration,
+        flip_reset_available,
+    );
     state.prev_controls = previous_controls;
 
     if reset_history {
@@ -509,6 +535,7 @@ fn restore_authoritative_player(
     player: &PlayerInfo,
     state: &mut CarState,
     initial_jump_duration: f32,
+    flip_reset_available: bool,
 ) {
     let controls = controls_from_rlbot(player.last_input);
     state.phys = physics_from_rlbot(player.physics);
@@ -518,15 +545,13 @@ fn restore_authoritative_player(
     state.has_flipped = player.has_dodged;
     state.flip_rel_torque = Vec3A::new(-player.dodge_dir.y, player.dodge_dir.x, 0.0);
     state.is_flipping = player.air_state == AirState::Dodging;
-    state.flip_time = if state.is_flipping || player.has_dodged {
+    state.flip_time = if state.is_flipping {
         player.dodge_elapsed.max(0.0)
     } else {
         0.0
     };
     state.is_jumping = player.air_state == AirState::Jumping;
     if player.air_state == AirState::DoubleJumping {
-        // RocketSim represents the double-jump impulse only through the persistent
-        // consumed flag; it has no equivalent 13-tick active-state discriminator.
         state.has_double_jumped = true;
         state.is_jumping = false;
         state.is_flipping = false;
@@ -546,7 +571,11 @@ fn restore_authoritative_player(
                 - player.dodge_timeout)
                 .clamp(0.0, consts::car::jump::DOUBLEJUMP_MAX_DELAY);
         } else {
-            state.air_time_since_jump = consts::car::jump::DOUBLEJUMP_MAX_DELAY;
+            state.air_time_since_jump = if flip_reset_available {
+                0.0
+            } else {
+                consts::car::jump::DOUBLEJUMP_MAX_DELAY
+            };
         }
     }
     state.boost = player.boost.clamp(0.0, 100.0);
