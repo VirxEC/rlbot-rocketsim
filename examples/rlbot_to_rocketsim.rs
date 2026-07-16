@@ -10,7 +10,8 @@ use rlbot_rocketsim::rocketsim::init_from_default;
 use rlbot_rocketsim::{GameStateEnricher, MatchContext};
 
 struct RocketSimAgent {
-    index: u32,
+    player_id: i32,
+    input_index: u32,
     enricher: GameStateEnricher,
 }
 
@@ -27,36 +28,23 @@ impl BotAgent for RocketSimAgent {
             .expect("build RocketSim match context from RLBot configuration");
 
         Self {
-            index: controllable_info.index,
+            player_id: match_config.player_configurations[controllable_info.index as usize]
+                .player_id,
+            input_index: controllable_info.index,
             enricher: GameStateEnricher::from_match_context(context),
         }
     }
 
     fn tick(&mut self, game_packet: &GamePacket, packet_queue: &mut PacketQueue) {
-        let Ok(mappings) = self.enricher.update(game_packet) else {
+        if self.enricher.update(game_packet).is_err() {
+            return;
+        }
+        let Some(_state) = self.enricher.car_state_by_player_id(self.player_id) else {
             return;
         };
-        let player_index = self.index as usize;
-        let Some(state) = self.enricher.car_state(player_index) else {
-            return;
-        };
-        let Some(mapping) = mappings.get(player_index) else {
-            return;
-        };
-        let ball = self.enricher.ball_state();
-
-        println!(
-            "RLBot player {} -> RocketSim car {}, position {:?}, wheels {:?}, contact {:?}",
-            mapping.player_index,
-            mapping.car_index,
-            state.phys.pos,
-            state.wheels_with_contact,
-            state.world_contact_normal,
-        );
-        println!("RocketSim ball position {:?}", ball.phys.pos);
 
         packet_queue.push(PlayerInput {
-            player_index: self.index,
+            player_index: self.input_index,
             controller_state: ControllerState::default(),
         });
     }

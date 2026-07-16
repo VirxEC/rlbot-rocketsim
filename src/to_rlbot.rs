@@ -37,6 +37,11 @@ pub struct CarConversionHistory {
     pub flip_reset_available: bool,
 }
 
+/// Converts a car state without packet-derived conversion history.
+///
+/// This is conservative: it cannot exactly recover RLBot's active
+/// `DoubleJumping` state or the initial-jump hold extension in `dodge_timeout`.
+/// Use [`car_to_player_info_with_history`] when retained history is available.
 pub trait CarInfoExt {
     fn to_rlbot_player_info(
         &self,
@@ -55,16 +60,24 @@ impl CarInfoExt for CarInfo {
     }
 }
 
+/// Stateless RocketSim-to-RLBot conversion helpers.
+///
+/// These methods cannot recover packet-derived `CarConversionHistory`; use
+/// [`car_to_player_info_with_history`] for packet-equivalent conversion.
 pub trait ArenaExt {
     /// Converts a car using `MatchConfiguration.player_configurations[CarInfo::idx]`.
+    ///
+    /// This is stateless and therefore conservative for history-dependent fields.
     fn car_to_rlbot_player_info(
         &self,
         car_index: usize,
         match_config: &MatchConfiguration,
     ) -> Result<PlayerInfo, ToRlbotError>;
 
-    /// Converts all cars in RocketSim index order. The resulting vector is
-    /// suitable for `GamePacket.players` with `players[N]` corresponding to car N.
+    /// Converts all cars in RocketSim index order without conversion history.
+    ///
+    /// The resulting vector is suitable for `GamePacket.players` with `players[N]`
+    /// corresponding to car N, but cannot exactly represent history-dependent fields.
     fn to_rlbot_players(
         &self,
         match_config: &MatchConfiguration,
@@ -97,6 +110,11 @@ impl ArenaExt for Arena {
     }
 }
 
+/// Converts a car without packet-derived conversion history.
+///
+/// This is conservative for RLBot fields that a bare [`CarState`] cannot represent
+/// exactly. Use [`car_to_player_info_with_history`] when retained packet history is
+/// available.
 pub fn car_to_player_info(
     info: &CarInfo,
     state: &CarState,

@@ -69,7 +69,7 @@ fn round_trip(info: &CarInfo, state: CarState, config: &PlayerConfiguration) -> 
 }
 
 #[test]
-fn all_shared_car_and_player_data_round_trips() {
+fn stateless_round_trip_preserves_directly_representable_car_data() {
     init_from_default(true).unwrap();
 
     let body_config = CarBodyConfig::DOMINUS;
@@ -178,11 +178,8 @@ fn all_shared_car_and_player_data_round_trips() {
     assert_float(converted.flip_time, original.flip_time, "flip_time");
     assert_eq!(converted.is_flipping, original.is_flipping);
     assert_eq!(converted.is_jumping, original.is_jumping);
-    assert_float(
-        converted.air_time_since_jump,
-        original.air_time_since_jump,
-        "air_time_since_jump",
-    );
+    // `air_time_since_jump` is not statelessly round-trippable: RLBot's
+    // `dodge_timeout` also depends on the initial jump hold duration.
     assert_float(converted.boost, original.boost, "boost");
     assert_eq!(converted.is_supersonic, original.is_supersonic);
     assert_eq!(converted.is_demoed, original.is_demoed);

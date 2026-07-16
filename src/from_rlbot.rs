@@ -104,10 +104,14 @@ impl GameStateEnricher {
         self.arena.get_ball_state()
     }
 
+    /// Returns the enriched car state for a slot in the latest `GamePacket.players`.
+    ///
+    /// Packet slots can change when player order changes; use
+    /// [`Self::car_state_by_player_id`] for stable participant identity.
     #[must_use]
-    pub fn car_state(&self, player_index: usize) -> Option<&CarState> {
+    pub fn car_state(&self, packet_player_index: usize) -> Option<&CarState> {
         self.players
-            .get(player_index)
+            .get(packet_player_index)
             .map(|player| self.arena.get_car_state(player.car_index))
     }
 
@@ -120,10 +124,18 @@ impl GameStateEnricher {
             .map(|player| self.arena.get_car_state(player.car_index))
     }
 
-    /// Returns the conversion history for a packet player.
+    /// Returns conversion history for a slot in the latest `GamePacket.players`.
+    ///
+    /// Packet slots can change when player order changes; use
+    /// [`Self::car_conversion_history_by_player_id`] for stable participant identity.
     #[must_use]
-    pub fn car_conversion_history(&self, player_index: usize) -> Option<CarConversionHistory> {
-        self.players.get(player_index).map(car_conversion_history)
+    pub fn car_conversion_history(
+        &self,
+        packet_player_index: usize,
+    ) -> Option<CarConversionHistory> {
+        self.players
+            .get(packet_player_index)
+            .map(car_conversion_history)
     }
 
     /// Returns the conversion history for an RLBot participant ID.
@@ -138,10 +150,12 @@ impl GameStateEnricher {
             .map(car_conversion_history)
     }
 
-    /// Returns the retained initial-jump duration for a packet player.
+    /// Returns retained initial-jump duration for a slot in the latest packet.
+    ///
+    /// Packet slots can change when player order changes.
     #[must_use]
-    pub fn initial_jump_duration(&self, player_index: usize) -> Option<f32> {
-        self.car_conversion_history(player_index)
+    pub fn initial_jump_duration(&self, packet_player_index: usize) -> Option<f32> {
+        self.car_conversion_history(packet_player_index)
             .map(|history| history.initial_jump_duration)
     }
 
@@ -196,14 +210,14 @@ impl GameStateEnricher {
         self.last_frame = Some(frame);
         self.last_phase = Some(packet.match_info.match_phase);
 
-        Ok(resolved
-            .iter()
-            .enumerate()
-            .map(|(player_index, resolved)| EnrichedPlayer {
+        let mut enriched_players = Vec::with_capacity(resolved.len());
+        for (player_index, resolved) in resolved.iter().enumerate() {
+            enriched_players.push(EnrichedPlayer {
                 player_index,
                 car_index: resolved.car_index,
-            })
-            .collect())
+            });
+        }
+        Ok(enriched_players)
     }
 
     fn validate_packet(&self, packet: &GamePacket) -> Result<(), EnrichmentError> {

@@ -111,6 +111,26 @@ fn builds_match_from_config_field_and_packet_data() {
 }
 
 #[test]
+fn rejects_non_soccar_modes() {
+    for mode in [
+        GameMode::Rumble,
+        GameMode::Hoops,
+        GameMode::Dropshot,
+        GameMode::Snowday,
+        GameMode::Heatseeker,
+        GameMode::Gridiron,
+        GameMode::Knockout,
+    ] {
+        let mut config = match_config(29);
+        config.game_mode = mode;
+        assert_eq!(
+            MatchContext::new(&config, &field_info()).unwrap_err(),
+            MatchContextError::UnsupportedGameMode(mode)
+        );
+    }
+}
+
+#[test]
 fn rejects_duplicate_configured_player_ids() {
     let mut config = match_config(29);
     config

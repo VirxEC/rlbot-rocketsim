@@ -48,6 +48,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }],
         ..MatchConfiguration::default()
     };
+    // `ArenaExt` is stateless. Use `car_to_player_info_with_history` instead
+    // when packet-derived jump/double-jump history must be preserved exactly.
     let players = arena.to_rlbot_players(&match_config)?;
     let player = &players[car_index];
 

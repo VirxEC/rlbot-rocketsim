@@ -17,6 +17,8 @@ let context = MatchContext::new(&match_configuration, &field_info)?;
 let mut enricher = GameStateEnricher::from_match_context(context);
 
 let players = enricher.update(&game_packet)?;
+// `player_index` is the latest GamePacket.players slot. Use
+// `car_state_by_player_id` when retaining participant identity across packets.
 let car = enricher.car_state(players[0].player_index).unwrap();
 let ball = enricher.ball_state();
 ```
@@ -26,8 +28,12 @@ for packet data such as physics, controls, boost, and jump state, while RocketSi
 supplies state RLBot does not expose, including wheel contacts, contact normals,
 and other simulation history.
 
-For the opposite direction, use `CarInfoExt` or `ArenaExt` to convert RocketSim
-cars into RLBot `PlayerInfo` values.
+For the opposite direction, use `CarInfoExt` or `ArenaExt` for conservative,
+stateless conversion of RocketSim cars into RLBot `PlayerInfo` values. A bare
+`CarState` cannot exactly recover the initial-jump hold extension in
+`dodge_timeout` or packet-authoritative active `DoubleJumping`; use
+`car_to_player_info_with_history` with `CarConversionHistory` when retained
+history is available.
 
 ## Examples
 
@@ -47,3 +53,6 @@ Run examples from the repository root so RocketSim can find `collision_meshes/`.
 - RLBot's `dodge_timeout` cannot be converted exactly into RocketSim's
   `air_time_since_jump`; the two timers measure different intervals.
 - Some state exists in only one API and therefore cannot be round-tripped.
+- `car_state`, `car_conversion_history`, and `initial_jump_duration` use the
+  latest `GamePacket.players` slot. Use their `*_by_player_id` counterparts for
+  stable participant identity across packet reordering.

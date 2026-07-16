@@ -53,7 +53,7 @@ impl MatchContext {
     ) -> Result<Self, MatchContextError> {
         let game_mode = game_mode_from_rlbot(match_config.game_mode)?;
         let mut arena_config = ArenaConfig::new(game_mode);
-        if !field_info.boost_pads.is_empty() && game_mode != GameMode::Dropshot {
+        if !field_info.boost_pads.is_empty() {
             arena_config.custom_boost_pads = Some(
                 field_info
                     .boost_pads
@@ -164,14 +164,8 @@ fn player_loadout(player_class: &PlayerClass) -> Option<&PlayerLoadout> {
 
 fn game_mode_from_rlbot(mode: RlbotGameMode) -> Result<GameMode, MatchContextError> {
     match mode {
-        RlbotGameMode::Soccar | RlbotGameMode::Rumble => Ok(GameMode::Soccar),
-        RlbotGameMode::Hoops => Ok(GameMode::Hoops),
-        RlbotGameMode::Dropshot => Ok(GameMode::Dropshot),
-        RlbotGameMode::Snowday => Ok(GameMode::Snowday),
-        RlbotGameMode::Heatseeker => Ok(GameMode::Heatseeker),
-        RlbotGameMode::Gridiron | RlbotGameMode::Knockout => {
-            Err(MatchContextError::UnsupportedGameMode(mode))
-        }
+        RlbotGameMode::Soccar => Ok(GameMode::Soccar),
+        _ => Err(MatchContextError::UnsupportedGameMode(mode)),
     }
 }
 
