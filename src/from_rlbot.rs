@@ -165,70 +165,22 @@ impl GameStateEnricher {
     /// Player additions preserve existing history. Departures and immutable car
     /// changes rebuild the arena because RocketSim does not expose car removal.
     pub fn update(&mut self, packet: &GamePacket) -> Result<Vec<EnrichedPlayer>, EnrichmentError> {
-        self.validate_packet(packet)?;
-
-        let frame = packet.match_info.frame_num;
-        let frame_rollback = self.last_frame.is_some_and(|last| frame < last);
-        let layout_changed = self.layout_changed(packet)?;
-        let gravity_changed =
-            self.arena_config.mutators.gravity.z != packet.match_info.world_gravity_z;
-        if gravity_changed {
-            self.arena_config.mutators.gravity.z = packet.match_info.world_gravity_z;
-        }
-        if frame_rollback || layout_changed || gravity_changed {
-            self.rebuild_arena();
-        }
-
-        let resumed_after_inactive = phase_advances(packet.match_info.match_phase)
-            && self.last_phase.is_some_and(|phase| !phase_advances(phase));
-        let reset_history = self.last_frame.is_none()
-            || frame_rollback
-            || layout_changed
-            || gravity_changed
-            || resumed_after_inactive;
-        let should_step = self.should_step(packet);
-        if reset_history {
-            for tracked in &mut self.players {
-                tracked.initial_jump_duration = 0.0;
-                tracked.double_jump_active = false;
-                tracked.flip_reset_available = false;
-            }
-        }
-        let resolved = self.resolve_players(packet)?;
-
-        if should_step {
-            for (player, resolved) in packet.players.iter().zip(&resolved) {
-                self.arena
-                    .set_car_controls(resolved.car_index, controls_from_rlbot(player.last_input));
-            }
-            self.arena.step_tick();
-        }
-
-        self.apply_players(packet, &resolved, reset_history, should_step);
-        self.sync_ball(packet)?;
-        self.sync_boost_pads(packet)?;
-        self.last_frame = Some(frame);
-        self.last_phase = Some(packet.match_info.match_phase);
-
-        let mut enriched_players = Vec::with_capacity(resolved.len());
-        for (player_index, resolved) in resolved.iter().enumerate() {
-            enriched_players.push(EnrichedPlayer {
-                player_index,
-                car_index: resolved.car_index,
-            });
-        }
-        Ok(enriched_players)
+        let plan = self.build_update_plan(packet)?;
+        Ok(self.apply_update_plan(plan))
     }
 
-    fn validate_packet(&self, packet: &GamePacket) -> Result<(), EnrichmentError> {
-        if self.match_context.is_some() && packet.balls.len() != 1 {
-            return Err(EnrichmentError::BallCount {
-                count: packet.balls.len(),
-            });
-        }
-        if let [ball] = packet.balls.as_slice() {
-            self.validate_ball_shape(ball)?;
-        }
+    fn build_update_plan<'a>(
+        &self,
+        packet: &'a GamePacket,
+    ) -> Result<UpdatePlan<'a>, EnrichmentError> {
+        let ball = match packet.balls.as_slice() {
+            [ball] => {
+                self.validate_ball_shape(ball)?;
+                Some(ball)
+            }
+            [] if self.match_context.is_none() => None,
+            balls => return Err(EnrichmentError::BallCount { count: balls.len() }),
+        };
         if self.match_context.is_some() && packet.boost_pads.len() != self.arena.num_boost_pads() {
             return Err(MatchContextError::BoostPadCountMismatch {
                 packet: packet.boost_pads.len(),
@@ -236,19 +188,146 @@ impl GameStateEnricher {
             }
             .into());
         }
-        for (player_index, player) in packet.players.iter().enumerate() {
-            if packet.players[..player_index]
+
+        let mut players = Vec::with_capacity(packet.players.len());
+        for (packet_player_index, player) in packet.players.iter().enumerate() {
+            if players
                 .iter()
-                .any(|other| other.player_id == player.player_id)
+                .any(|planned: &PlannedPlayer<'_>| planned.player_id == player.player_id)
             {
                 return Err(EnrichmentError::DuplicatePlayerId {
                     player_id: player.player_id,
                 });
             }
-            team_from_rlbot(player_index, player)?;
-            self.body_config_for_player(player_index, player)?;
+            players.push(PlannedPlayer {
+                player,
+                player_id: player.player_id,
+                team: team_from_rlbot(packet_player_index, player)?,
+                body_config: self.body_config_for_player(packet_player_index, player)?,
+                existing_player_index: self
+                    .players
+                    .iter()
+                    .position(|tracked| tracked.player_id == player.player_id),
+                controls: controls_from_rlbot(player.last_input),
+            });
         }
-        Ok(())
+
+        let frame = packet.match_info.frame_num;
+        let frame_rollback = self.last_frame.is_some_and(|last| frame < last);
+        let layout_changed = self.players.iter().any(|tracked| {
+            !players
+                .iter()
+                .any(|planned| planned.player_id == tracked.player_id)
+        }) || players.iter().any(|planned| {
+            planned.existing_player_index.is_some_and(|index| {
+                let tracked = &self.players[index];
+                tracked.team != planned.team || tracked.body_config != planned.body_config
+            })
+        });
+        let gravity_changed =
+            self.arena_config.mutators.gravity.z != packet.match_info.world_gravity_z;
+        let mut arena_config = self.arena_config.clone();
+        if gravity_changed {
+            arena_config.mutators.gravity.z = packet.match_info.world_gravity_z;
+        }
+        let rebuild = frame_rollback || layout_changed || gravity_changed;
+        let resumed_after_inactive = phase_advances(packet.match_info.match_phase)
+            && self.last_phase.is_some_and(|phase| !phase_advances(phase));
+        let reset_history = self.last_frame.is_none()
+            || frame_rollback
+            || layout_changed
+            || gravity_changed
+            || resumed_after_inactive;
+        let should_step = phase_advances(packet.match_info.match_phase)
+            && self.last_frame.is_some_and(|last| frame > last);
+        let boost_pads = if packet.boost_pads.is_empty() && self.match_context.is_none() {
+            None
+        } else {
+            if packet.boost_pads.len() != self.arena.num_boost_pads() {
+                return Err(MatchContextError::BoostPadCountMismatch {
+                    packet: packet.boost_pads.len(),
+                    arena: self.arena.num_boost_pads(),
+                }
+                .into());
+            }
+            Some(
+                packet
+                    .boost_pads
+                    .iter()
+                    .enumerate()
+                    .map(|(index, pad)| {
+                        let config = self.arena.get_boost_pad_config(index);
+                        let max_cooldown = if config.is_big {
+                            self.arena.mutator_config().boost_pad_cooldown_big
+                        } else {
+                            self.arena.mutator_config().boost_pad_cooldown_small
+                        };
+                        BoostPadState {
+                            cooldown: if pad.is_active {
+                                0.0
+                            } else {
+                                (max_cooldown - pad.timer).clamp(0.0, max_cooldown)
+                            },
+                        }
+                    })
+                    .collect(),
+            )
+        };
+
+        Ok(UpdatePlan {
+            players,
+            arena_config,
+            rebuild,
+            reset_history,
+            should_step,
+            ball,
+            boost_pads,
+            frame,
+            phase: packet.match_info.match_phase,
+        })
+    }
+
+    fn apply_update_plan(&mut self, plan: UpdatePlan<'_>) -> Vec<EnrichedPlayer> {
+        self.arena_config = plan.arena_config;
+        if plan.rebuild {
+            self.rebuild_arena();
+        }
+        if plan.reset_history {
+            for tracked in &mut self.players {
+                tracked.initial_jump_duration = 0.0;
+                tracked.double_jump_active = false;
+                tracked.flip_reset_available = false;
+            }
+        }
+        let resolved = self.resolve_players_from_plan(&plan.players);
+
+        if plan.should_step {
+            for (planned, resolved) in plan.players.iter().zip(&resolved) {
+                self.arena
+                    .set_car_controls(resolved.car_index, planned.controls);
+            }
+            self.arena.step_tick();
+        }
+
+        self.apply_players_from_plan(
+            &plan.players,
+            &resolved,
+            plan.reset_history,
+            plan.should_step,
+        );
+        self.apply_ball_from_plan(plan.ball);
+        self.apply_boost_pads_from_plan(plan.boost_pads.as_deref());
+        self.last_frame = Some(plan.frame);
+        self.last_phase = Some(plan.phase);
+
+        resolved
+            .iter()
+            .enumerate()
+            .map(|(player_index, resolved)| EnrichedPlayer {
+                player_index,
+                car_index: resolved.car_index,
+            })
+            .collect()
     }
 
     fn validate_ball_shape(&self, ball: &rlbot::flat::BallInfo) -> Result<(), EnrichmentError> {
@@ -282,37 +361,6 @@ impl GameStateEnricher {
         }
     }
 
-    fn layout_changed(&self, packet: &GamePacket) -> Result<bool, EnrichmentError> {
-        if self.players.is_empty() {
-            return Ok(false);
-        }
-        if packet.players.len() < self.players.len()
-            || self.players.iter().any(|tracked| {
-                !packet
-                    .players
-                    .iter()
-                    .any(|player| player.player_id == tracked.player_id)
-            })
-        {
-            return Ok(true);
-        }
-        for (index, player) in packet.players.iter().enumerate() {
-            let Some(tracked) = self
-                .players
-                .iter()
-                .find(|tracked| tracked.player_id == player.player_id)
-            else {
-                continue;
-            };
-            let team = team_from_rlbot(index, player)?;
-            let body = self.body_config_for_player(index, player)?;
-            if tracked.team != team || tracked.body_config != body {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     fn rebuild_arena(&mut self) {
         self.arena = Arena::new_with_config(self.arena_config.clone());
         self.players.clear();
@@ -320,33 +368,21 @@ impl GameStateEnricher {
         self.last_phase = None;
     }
 
-    fn should_step(&self, packet: &GamePacket) -> bool {
-        phase_advances(packet.match_info.match_phase)
-            && self
-                .last_frame
-                .is_some_and(|last| packet.match_info.frame_num > last)
-    }
-
-    fn resolve_players(
-        &mut self,
-        packet: &GamePacket,
-    ) -> Result<Vec<ResolvedPlayer>, EnrichmentError> {
-        let mut ordered_players = Vec::with_capacity(packet.players.len());
-        for (index, player) in packet.players.iter().enumerate() {
-            let team = team_from_rlbot(index, player)?;
-            let body_config = self.body_config_for_player(index, player)?;
+    fn resolve_players_from_plan(&mut self, players: &[PlannedPlayer<'_>]) -> Vec<ResolvedPlayer> {
+        let mut ordered_players = Vec::with_capacity(players.len());
+        for planned in players {
             let tracked = if let Some(position) = self
                 .players
                 .iter()
-                .position(|tracked| tracked.player_id == player.player_id)
+                .position(|tracked| tracked.player_id == planned.player_id)
             {
                 self.players.remove(position)
             } else {
                 TrackedPlayer {
-                    car_index: self.arena.add_car(team, body_config),
-                    player_id: player.player_id,
-                    team,
-                    body_config,
+                    car_index: self.arena.add_car(planned.team, planned.body_config),
+                    player_id: planned.player_id,
+                    team: planned.team,
+                    body_config: planned.body_config,
                     previous_controls: CarControls::default(),
                     initial_jump_duration: 0.0,
                     double_jump_active: false,
@@ -356,8 +392,7 @@ impl GameStateEnricher {
             ordered_players.push(tracked);
         }
         self.players = ordered_players;
-        Ok(self
-            .players
+        self.players
             .iter()
             .map(|tracked| ResolvedPlayer {
                 car_index: tracked.car_index,
@@ -365,23 +400,24 @@ impl GameStateEnricher {
                 initial_jump_duration: tracked.initial_jump_duration,
                 flip_reset_available: tracked.flip_reset_available,
             })
-            .collect())
+            .collect()
     }
 
-    fn apply_players(
+    fn apply_players_from_plan(
         &mut self,
-        packet: &GamePacket,
+        players: &[PlannedPlayer<'_>],
         resolved: &[ResolvedPlayer],
         reset_history: bool,
         stepped: bool,
     ) {
-        for (index, (player, resolved)) in packet.players.iter().zip(resolved).enumerate() {
+        for (index, (planned, resolved)) in players.iter().zip(resolved).enumerate() {
+            let player = planned.player;
             let mut simulated = *self.arena.get_car_state(resolved.car_index);
             simulated.is_on_ground = simulated.num_wheels_in_contact() >= 3;
             let previous_controls = if stepped {
                 simulated.prev_controls
             } else if reset_history {
-                controls_from_rlbot(player.last_input)
+                planned.controls
             } else {
                 resolved.previous_controls
             };
@@ -398,7 +434,7 @@ impl GameStateEnricher {
             self.arena.set_car_state(resolved.car_index, state);
             self.arena
                 .set_car_controls(resolved.car_index, state.controls);
-            self.players[index].previous_controls = controls_from_rlbot(player.last_input);
+            self.players[index].previous_controls = planned.controls;
             if player.air_state == AirState::Jumping {
                 self.players[index].initial_jump_duration =
                     state.jump_time.clamp(0.0, consts::car::jump::MAX_TIME);
@@ -434,21 +470,41 @@ impl GameStateEnricher {
         )
     }
 
-    fn sync_ball(&mut self, packet: &GamePacket) -> Result<(), EnrichmentError> {
-        let ball = match packet.balls.as_slice() {
-            [ball] => ball,
-            [] if self.match_context.is_none() => return Ok(()),
-            balls => return Err(EnrichmentError::BallCount { count: balls.len() }),
+    fn apply_ball_from_plan(&mut self, ball: Option<&rlbot::flat::BallInfo>) {
+        let Some(ball) = ball else {
+            return;
         };
         let mut state = *self.arena.get_ball_state();
         apply_ball(ball, &mut state);
         self.arena.set_ball_state(state);
-        Ok(())
     }
 
-    fn sync_boost_pads(&mut self, packet: &GamePacket) -> Result<(), EnrichmentError> {
-        apply_boost_pads(&mut self.arena, packet)
+    fn apply_boost_pads_from_plan(&mut self, boost_pads: Option<&[BoostPadState]>) {
+        for (index, state) in boost_pads.unwrap_or_default().iter().enumerate() {
+            self.arena.set_boost_pad_state(index, *state);
+        }
     }
+}
+
+struct PlannedPlayer<'a> {
+    player: &'a PlayerInfo,
+    player_id: i32,
+    team: Team,
+    body_config: CarBodyConfig,
+    existing_player_index: Option<usize>,
+    controls: CarControls,
+}
+
+struct UpdatePlan<'a> {
+    players: Vec<PlannedPlayer<'a>>,
+    arena_config: ArenaConfig,
+    rebuild: bool,
+    reset_history: bool,
+    should_step: bool,
+    ball: Option<&'a rlbot::flat::BallInfo>,
+    boost_pads: Option<Vec<BoostPadState>>,
+    frame: u32,
+    phase: MatchPhase,
 }
 
 #[derive(Clone, Copy)]
@@ -477,39 +533,6 @@ fn apply_ball(ball: &rlbot::flat::BallInfo, state: &mut BallState) {
     if ball.charge_level >= 0 {
         state.ds_info.charge_level = (ball.charge_level as u8).saturating_add(1).clamp(1, 3);
     }
-}
-
-fn apply_boost_pads(arena: &mut Arena, packet: &GamePacket) -> Result<(), EnrichmentError> {
-    if packet.boost_pads.is_empty() {
-        return Ok(());
-    }
-    if packet.boost_pads.len() != arena.num_boost_pads() {
-        return Err(MatchContextError::BoostPadCountMismatch {
-            packet: packet.boost_pads.len(),
-            arena: arena.num_boost_pads(),
-        }
-        .into());
-    }
-    for (index, pad) in packet.boost_pads.iter().enumerate() {
-        let config = arena.get_boost_pad_config(index);
-        let max_cooldown = if config.is_big {
-            arena.mutator_config().boost_pad_cooldown_big
-        } else {
-            arena.mutator_config().boost_pad_cooldown_small
-        };
-        arena.set_boost_pad_state(
-            index,
-            BoostPadState {
-                // RLBot reports elapsed time since pickup; RocketSim stores time remaining.
-                cooldown: if pad.is_active {
-                    0.0
-                } else {
-                    (max_cooldown - pad.timer).clamp(0.0, max_cooldown)
-                },
-            },
-        );
-    }
-    Ok(())
 }
 
 fn team_from_rlbot(player_index: usize, player: &PlayerInfo) -> Result<Team, EnrichmentError> {
@@ -944,6 +967,36 @@ mod tests {
         assert_eq!(snapshot.num_cars(), 1);
         assert_eq!(snapshot.cars[0].0.idx, 0);
         assert_eq!(snapshot.ball.phys.pos, enricher.ball_state().phys.pos);
+    }
+
+    #[test]
+    fn absent_boost_pad_states_leave_non_context_arena_unchanged() {
+        init_from_default(true).unwrap();
+        let arena = Arena::new(GameMode::Soccar);
+        let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::default());
+        let pad_index = 0;
+        let mut first = packet(1, player());
+        first.boost_pads = (0..enricher.arena().num_boost_pads())
+            .map(|_| RlbotBoostPadState {
+                is_active: true,
+                timer: 0.0,
+            })
+            .collect();
+        first.boost_pads[pad_index] = RlbotBoostPadState {
+            is_active: false,
+            timer: 2.5,
+        };
+        enricher.update(&first).unwrap();
+        let cooldown = enricher.arena().get_boost_pad_state(pad_index).cooldown;
+
+        let mut second = packet(2, player());
+        second.match_info.match_phase = MatchPhase::Paused;
+        enricher.update(&second).unwrap();
+
+        assert_eq!(
+            enricher.arena().get_boost_pad_state(pad_index).cooldown,
+            cooldown
+        );
     }
 
     #[test]

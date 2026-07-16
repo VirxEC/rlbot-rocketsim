@@ -76,6 +76,116 @@ fn dominus_player() -> PlayerInfo {
     }
 }
 
+fn valid_packet(frame: u32) -> GamePacket {
+    let mut packet = GamePacket::default();
+    packet.match_info.frame_num = frame;
+    packet.match_info.match_phase = rlbot_rocketsim::rlbot::flat::MatchPhase::Active;
+    packet.match_info.world_gravity_z = -650.0;
+    packet.players.push(dominus_player());
+    packet.balls.push(standard_ball());
+    packet.boost_pads.push(BoostPadState {
+        is_active: false,
+        timer: 4.25,
+    });
+    packet
+}
+
+fn populated_enricher() -> GameStateEnricher {
+    init_from_default(true).unwrap();
+
+    let context = MatchContext::new(&match_config(29), &field_info()).unwrap();
+    let mut enricher = GameStateEnricher::from_match_context(context);
+    enricher.update(&valid_packet(1)).unwrap();
+    enricher.update(&valid_packet(2)).unwrap();
+    enricher
+}
+
+fn assert_matches_control_after_invalid_packet(mut invalid: GamePacket, expected: EnrichmentError) {
+    let mut enricher = populated_enricher();
+    let mut control = populated_enricher();
+
+    let before_arena = format!("{:?}", enricher.arena_state());
+    let before_ball = format!("{:?}", enricher.ball_state());
+    let before_car = format!("{:?}", enricher.car_state_by_player_id(7).unwrap());
+    let before_history = enricher.car_conversion_history_by_player_id(7).unwrap();
+    let before_tick = enricher.arena().tick_count();
+    let before_gravity = enricher.arena().get_config().mutators.gravity;
+    let before_pad = format!("{:?}", enricher.arena().get_boost_pad_state(0));
+
+    assert_eq!(enricher.update(&invalid), Err(expected));
+    assert_eq!(format!("{:?}", enricher.arena_state()), before_arena);
+    assert_eq!(format!("{:?}", enricher.ball_state()), before_ball);
+    assert_eq!(
+        format!("{:?}", enricher.car_state_by_player_id(7).unwrap()),
+        before_car
+    );
+    assert_eq!(
+        enricher.car_conversion_history_by_player_id(7).unwrap(),
+        before_history
+    );
+    assert_eq!(enricher.arena().tick_count(), before_tick);
+    assert_eq!(
+        enricher.arena().get_config().mutators.gravity,
+        before_gravity
+    );
+    assert_eq!(
+        format!("{:?}", enricher.arena().get_boost_pad_state(0)),
+        before_pad
+    );
+
+    invalid.match_info.frame_num = 3;
+    invalid.match_info.world_gravity_z = -650.0;
+    invalid.players = vec![dominus_player()];
+    invalid.balls = vec![standard_ball()];
+    invalid.boost_pads = vec![BoostPadState {
+        is_active: false,
+        timer: 4.25,
+    }];
+
+    let actual = enricher.update(&invalid).unwrap();
+    let expected = control.update(&invalid).unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        format!("{:?}", enricher.arena_state()),
+        format!("{:?}", control.arena_state())
+    );
+    assert_eq!(
+        enricher.car_conversion_history_by_player_id(7),
+        control.car_conversion_history_by_player_id(7)
+    );
+}
+
+#[test]
+fn packet_error_with_rollback_gravity_change_and_departure_keeps_populated_enricher_unchanged() {
+    let mut invalid = valid_packet(1);
+    invalid.match_info.world_gravity_z = -500.0;
+    invalid.players.clear();
+    invalid.boost_pads.clear();
+
+    assert_matches_control_after_invalid_packet(
+        invalid,
+        EnrichmentError::MatchContext(MatchContextError::BoostPadCountMismatch {
+            packet: 0,
+            arena: 1,
+        }),
+    );
+}
+
+#[test]
+fn packet_error_after_rebuild_trigger_preserves_populated_state() {
+    let mut invalid = valid_packet(1);
+    invalid.match_info.world_gravity_z = -500.0;
+    invalid.players[0].team = 2;
+
+    assert_matches_control_after_invalid_packet(
+        invalid,
+        EnrichmentError::InvalidTeam {
+            player_index: 0,
+            team: 2,
+        },
+    );
+}
+
 #[test]
 fn builds_match_from_config_field_and_packet_data() {
     init_from_default(true).unwrap();

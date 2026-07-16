@@ -33,7 +33,10 @@ stateless conversion of RocketSim cars into RLBot `PlayerInfo` values. A bare
 `CarState` cannot exactly recover the initial-jump hold extension in
 `dodge_timeout` or packet-authoritative active `DoubleJumping`; use
 `car_to_player_info_with_history` with `CarConversionHistory` when retained
-history is available.
+history is available. A finite stateless `dodge_timeout` is a guaranteed lower
+bound (it assumes a zero initial-jump hold extension), not the original packet
+value; it may conservatively emit `-1` while an unknown hold extension could
+still leave time available.
 
 ## Examples
 
