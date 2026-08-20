@@ -321,9 +321,8 @@ fn rlbot_player_shared_fields_round_trip() {
     assert_rotation(converted_rotation, original_rotation);
     assert_eq!(converted.last_input, original.last_input);
     assert_eq!(converted.air_state, original.air_state);
-    // RLBot's dodge_timeout includes the variable initial-jump hold extension, while
-    // RocketSim tracks time since that jump ended. The exact timeout is not invertible.
-    assert!(converted.dodge_timeout >= original.dodge_timeout);
+    // RLBot reports no dodge timeout while the initial jump force is active.
+    assert_eq!(converted.dodge_timeout, -1.0);
     assert_eq!(converted.demolished_timeout, original.demolished_timeout);
     assert_eq!(converted.is_supersonic, original.is_supersonic);
     assert_eq!(converted.is_bot, original.is_bot);

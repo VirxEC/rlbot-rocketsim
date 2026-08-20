@@ -82,6 +82,15 @@ pub trait ArenaExt {
         &self,
         match_config: &MatchConfiguration,
     ) -> Result<Vec<PlayerInfo>, ToRlbotError>;
+
+    /// Converts all cars with one retained history value per RocketSim car.
+    ///
+    /// Missing history values use conservative stateless conversion.
+    fn to_rlbot_players_with_history(
+        &self,
+        match_config: &MatchConfiguration,
+        histories: &[CarConversionHistory],
+    ) -> Result<Vec<PlayerInfo>, ToRlbotError>;
 }
 
 impl ArenaExt for Arena {
@@ -106,6 +115,25 @@ impl ArenaExt for Arena {
     ) -> Result<Vec<PlayerInfo>, ToRlbotError> {
         (0..self.num_cars())
             .map(|car_index| self.car_to_rlbot_player_info(car_index, match_config))
+            .collect()
+    }
+
+    fn to_rlbot_players_with_history(
+        &self,
+        match_config: &MatchConfiguration,
+        histories: &[CarConversionHistory],
+    ) -> Result<Vec<PlayerInfo>, ToRlbotError> {
+        (0..self.num_cars())
+            .map(|car_index| {
+                let (info, state) = self.get_car_info_and_state(car_index);
+                let player_config = match_config.player_configurations.get(info.idx).ok_or(
+                    ToRlbotError::MissingPlayerConfiguration {
+                        car_index: info.idx,
+                    },
+                )?;
+                let history = histories.get(car_index).copied().unwrap_or_default();
+                car_to_player_info_with_history(info, state, player_config, history)
+            })
             .collect()
     }
 }
@@ -150,6 +178,7 @@ pub fn car_to_player_info_with_history(
         + initial_jump_duration
         - state.air_time_since_jump;
     let dodge_timeout = if air_state == AirState::OnGround
+        || air_state == AirState::Jumping
         || history.flip_reset_available
         || !state.has_jumped
         || state.has_double_jumped
@@ -371,7 +400,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!((converted.dodge_timeout - 1.35).abs() < 1e-5);
+        assert_eq!(converted.dodge_timeout, -1.0);
     }
 
     #[test]
