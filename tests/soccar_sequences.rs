@@ -95,7 +95,7 @@ fn jump_hold_release_and_double_jump_sequence() {
 
     let state = enricher.car_state(0).unwrap();
     assert!(!state.is_jumping);
-    assert_eq!(state.jump_time, 0.0);
+    assert_eq!(state.jump_ticks, 0);
     assert!((state.air_time_since_jump - 0.05).abs() < 1e-5);
 
     airborne.air_state = AirState::DoubleJumping;

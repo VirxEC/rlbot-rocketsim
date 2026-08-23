@@ -6,7 +6,7 @@ use rocketsim::{
 };
 use thiserror::Error;
 
-use crate::common::{controls_from_rlbot, physics_from_rlbot};
+use crate::common::{MAX_JUMP_HOLD_TIME, controls_from_rlbot, physics_from_rlbot};
 use crate::match_context::{MatchContext, MatchContextError};
 use crate::to_rlbot::CarConversionHistory;
 
@@ -437,7 +437,7 @@ impl GameStateEnricher {
             self.players[index].previous_controls = planned.controls;
             if player.air_state == AirState::Jumping {
                 self.players[index].initial_jump_duration =
-                    state.jump_time.clamp(0.0, consts::car::jump::MAX_TIME);
+                    state.jump_time().clamp(0.0, MAX_JUMP_HOLD_TIME);
             } else if !player.has_jumped {
                 self.players[index].initial_jump_duration = 0.0;
             }
@@ -566,7 +566,7 @@ fn merge_authoritative_player(
         // AirState describes jump/dodge forces, not wheel contact. Leave contact
         // fields under RocketSim's control so its collision state can establish them.
         state.air_time = 0.0;
-        state.jump_time = 0.0;
+        state.jump_ticks = 0;
         state.is_boosting = false;
         state.boosting_time = 0.0;
         state.time_since_boosted = 0.0;
@@ -614,17 +614,17 @@ fn restore_authoritative_player(
         state.is_flipping = false;
     }
     if state.is_jumping {
-        // RLBot does not expose elapsed initial-jump time. Keep RocketSim's estimate while
-        // the state is continuous, bounded by the documented maximum hold duration.
-        state.jump_time = state.jump_time.clamp(0.0, consts::car::jump::MAX_TIME);
+        // RLBot does not expose elapsed initial-jump hold ticks. Keep RocketSim's
+        // estimate while the state is continuous, bounded by the documented maximum.
+        state.jump_ticks = state.jump_ticks.min(consts::car::jump::MAX_TICKS);
         state.air_time_since_jump = 0.0;
     } else {
-        state.jump_time = 0.0;
+        state.jump_ticks = 0;
         if !player.has_jumped {
             state.air_time_since_jump = 0.0;
         } else if player.dodge_timeout >= 0.0 {
             state.air_time_since_jump = (consts::car::jump::DOUBLEJUMP_MAX_DELAY
-                + initial_jump_duration.clamp(0.0, consts::car::jump::MAX_TIME)
+                + initial_jump_duration.clamp(0.0, MAX_JUMP_HOLD_TIME)
                 - player.dodge_timeout)
                 .clamp(0.0, consts::car::jump::DOUBLEJUMP_MAX_DELAY);
         } else {
@@ -937,7 +937,7 @@ mod tests {
         enricher.update(&packet(13, airborne)).unwrap();
 
         let state = enricher.car_state(0).unwrap();
-        assert_eq!(state.jump_time, 0.0);
+        assert_eq!(state.jump_ticks, 0);
         assert!((state.air_time_since_jump - 0.05).abs() < 1e-5);
     }
 

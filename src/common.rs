@@ -2,6 +2,10 @@ use glam::{EulerRot, Mat3A, Vec3A};
 use rlbot::flat::{ControllerState, Physics, Rotator, Vector2, Vector3};
 use rocketsim::{CarControls, PhysState};
 
+/// Maximum initial-jump hold duration: RocketSim's `jump::MAX_TICKS` (0.2 s at 120 Hz).
+pub(crate) const MAX_JUMP_HOLD_TIME: f32 =
+    rocketsim::consts::car::jump::MAX_TICKS as f32 * rocketsim::consts::TICK_TIME;
+
 pub(crate) fn vector3_to_rlbot(vector: Vec3A) -> Vector3 {
     Vector3 {
         x: vector.x,

@@ -5,7 +5,9 @@ use rocketsim::{Arena, CarInfo, CarState};
 use thiserror::Error;
 
 use crate::body::car_body_config_for_product_id;
-use crate::common::{controls_to_rlbot, physics_to_rlbot, vector2_to_rlbot, vector3_to_rlbot};
+use crate::common::{
+    MAX_JUMP_HOLD_TIME, controls_to_rlbot, physics_to_rlbot, vector2_to_rlbot, vector3_to_rlbot,
+};
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ToRlbotError {
@@ -171,9 +173,7 @@ pub fn car_to_player_info_with_history(
         AirState::InAir
     };
 
-    let initial_jump_duration = history
-        .initial_jump_duration
-        .clamp(0.0, rocketsim::consts::car::jump::MAX_TIME);
+    let initial_jump_duration = history.initial_jump_duration.clamp(0.0, MAX_JUMP_HOLD_TIME);
     let dodge_time_remaining = rocketsim::consts::car::jump::DOUBLEJUMP_MAX_DELAY
         + initial_jump_duration
         - state.air_time_since_jump;
@@ -279,7 +279,7 @@ fn player_name_and_bot(player_class: &PlayerClass, player_index: usize) -> (Stri
 #[cfg(test)]
 mod tests {
     use rlbot::flat::{CustomBot, PlayerLoadout};
-    use rocketsim::{CarBodyConfig, Team};
+    use rocketsim::{CarBodyConfig, Team, consts};
 
     use super::*;
 
@@ -352,7 +352,7 @@ mod tests {
             is_on_ground: false,
             wheels_with_contact: [false; 4],
             has_jumped: true,
-            jump_time: 0.65,
+            jump_ticks: (0.65 * consts::TICK_RATE) as u32,
             air_time_since_jump: 0.45,
             ..CarState::default()
         };
@@ -385,7 +385,7 @@ mod tests {
             is_on_ground: true,
             is_jumping: true,
             has_jumped: true,
-            jump_time: 0.1,
+            jump_ticks: (0.1 * consts::TICK_RATE) as u32,
             ..CarState::default()
         };
 

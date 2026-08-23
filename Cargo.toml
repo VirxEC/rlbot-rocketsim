@@ -17,9 +17,3 @@ thiserror = "2.0.18"
 
 [lints.clippy]
 all = "warn"
-
-[patch."https://github.com/ZealanL/RocketSim.git"]
-rocketsim = {
-  git = "https://github.com/VirxEC/RocketSim.git",
-  branch = "fix-jump"
-}
