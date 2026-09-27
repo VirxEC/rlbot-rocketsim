@@ -2,6 +2,15 @@
 name = "rlbot-rocketsim"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.95"
+description = "Conversions and stateful enrichment between RLBot packets and RocketSim"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/VirxEC/rlbot-rocketsim"
+homepage = "https://github.com/VirxEC/rlbot-rocketsim"
+keywords = ["rocket-league", "rlbot", "rocketsim", "simulation", "bots"]
+categories = ["game-development", "simulation"]
+exclude = ["AGENTS.md"]
 
 [dependencies]
 glam = "0.33.0"

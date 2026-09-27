@@ -1,12 +1,26 @@
+//! Convert a RocketSim car back into an RLBot `PlayerInfo` (offline).
+//!
+//! Run from the repository root so RocketSim can find `collision_meshes/`:
+//!
+//! ```sh
+//! cargo run --example rocketsim_to_rlbot
+//! ```
+//!
+//! [`ArenaExt::to_rlbot_players`](rlbot_rocketsim::to_rlbot::ArenaExt) is
+//! stateless: physics, boost, and inputs convert exactly, while jump timing
+//! is conservative. When you kept the enricher's [`CarConversionHistory`],
+//! use [`car_to_player_info_with_history`](rlbot_rocketsim::to_rlbot::car_to_player_info_with_history)
+//! instead (see `examples/offline_enrichment.rs` for that path).
+
 use glam::{EulerRot, Mat3A, Vec3A};
 use rlbot_rocketsim::rlbot::flat::{
     CustomBot, MatchConfiguration, PlayerClass, PlayerConfiguration, PlayerLoadout,
 };
 use rlbot_rocketsim::rocketsim::{
-    Arena, CarBodyConfig, CarControls, CarState, GameMode, PhysState, Team, init_from_default,
+    Arena, CarBodyConfig, CarControls, CarState, GameMode, PhysState, RaycastHitInfo, Team,
+    UserInfoType, init_from_default,
 };
 use rlbot_rocketsim::to_rlbot::ArenaExt;
-use rocketsim::{RaycastHitInfo, UserInfoType};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_from_default(true)?;

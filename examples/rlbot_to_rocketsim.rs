@@ -1,3 +1,18 @@
+//! Live RLBot bot that enriches every packet with RocketSim contacts.
+//!
+//! Needs a running RLBot server (see the `rlbot` crate docs for setup):
+//!
+//! ```sh
+//! cargo run --example rlbot_to_rocketsim
+//! ```
+//!
+//! For an offline walkthrough without a server, see
+//! `examples/offline_enrichment.rs` instead. The pattern is the same:
+//! build a [`MatchContext`](rlbot_rocketsim::MatchContext) once from the
+//! match configuration, wrap it in a
+//! [`GameStateEnricher`](rlbot_rocketsim::GameStateEnricher), then call
+//! `update` per `GamePacket` and read cars by stable `player_id`.
+
 use std::sync::Arc;
 
 use rlbot_rocketsim::rlbot::RLBotConnection;

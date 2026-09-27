@@ -41,11 +41,19 @@ still leave time available.
 ## Examples
 
 ```sh
-cargo run --example rlbot_to_rocketsim
+cargo run --example offline_enrichment
 cargo run --example rocketsim_to_rlbot
+cargo run --example rlbot_to_rocketsim
 ```
 
 Run examples from the repository root so RocketSim can find `collision_meshes/`.
+
+- `offline_enrichment`: synthetic Soccar packets without a server. Shows the
+  per-tick `update` loop, why contacts appear on the second frame, the
+  `player_id` lookup, and the history-aware trip back to RLBot.
+- `rocketsim_to_rlbot`: stateless RocketSim → RLBot conversion of one car.
+- `rlbot_to_rocketsim`: live bot against an RLBot server. Needs the server;
+  start with `offline_enrichment` otherwise.
 
 ## Important limitations
 

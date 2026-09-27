@@ -1,3 +1,52 @@
+//! Convert RocketSim cars back into RLBot [`PlayerInfo`] values.
+//!
+//! A bare [`CarState`] cannot remember everything RLBot
+//! needs: the variable initial-jump hold inside `dodge_timeout` and a
+//! transient `DoubleJumping` force both require packet history. That is why
+//! this module offers two levels:
+//!
+//! - **Stateless:** [`CarInfoExt`], [`ArenaExt::car_to_rlbot_player_info`], and
+//!   [`ArenaExt::to_rlbot_players`] never invent timing. A finite stateless
+//!   `dodge_timeout` is a lower bound (zero hold assumed), and unknown double
+//!   jumps conservatively read as `InAir`.
+//! - **History-aware:** [`car_to_player_info_with_history`] and
+//!   [`ArenaExt::to_rlbot_players_with_history`] take the
+//!   [`CarConversionHistory`] retained by [`GameStateEnricher`](crate::GameStateEnricher).
+//!
+//! # Example
+//!
+//! ```rust
+//! use rlbot_rocketsim::rlbot::flat::{CustomBot, PlayerClass, PlayerConfiguration, PlayerLoadout};
+//! use rlbot_rocketsim::rocketsim::{Arena, CarBodyConfig, GameMode, Team};
+//! use rlbot_rocketsim::to_rlbot::{ArenaExt, car_to_player_info_with_history};
+//! use rlbot_rocketsim::CarConversionHistory;
+//!
+//! let mut arena = Arena::new(GameMode::TheVoid);
+//! let car_index = arena.add_car(Team::Blue, CarBodyConfig::OCTANE);
+//! let config = PlayerConfiguration {
+//!     variety: PlayerClass::CustomBot(Box::new(CustomBot {
+//!         name: "Example".into(),
+//!         loadout: Some(Box::new(PlayerLoadout { car_id: 23, ..Default::default() })),
+//!         ..Default::default()
+//!     })),
+//!     team: Team::Blue as u32,
+//!     player_id: 7,
+//! };
+//!
+//! // Stateless: fine for physics, boost, and inputs.
+//! let stateless = arena.car_to_rlbot_player_info(car_index, &rlbot_rocketsim::rlbot::flat::MatchConfiguration {
+//!     player_configurations: vec![config.clone()],
+//!     ..Default::default()
+//! });
+//! assert!(stateless.is_ok());
+//!
+//! // History-aware: exact jump timing when you kept the enricher history.
+//! let (info, state) = arena.get_car_info_and_state(car_index);
+//! let history = CarConversionHistory::default();
+//! let player = car_to_player_info_with_history(info, state, &config, history).unwrap();
+//! assert_eq!(player.player_id, 7);
+//! ```
+
 use rlbot::flat::{
     AirState, BoxShape, MatchConfiguration, PlayerClass, PlayerConfiguration, PlayerInfo,
 };
@@ -9,10 +58,19 @@ use crate::common::{
     MAX_JUMP_HOLD_TIME, controls_to_rlbot, physics_to_rlbot, vector2_to_rlbot, vector3_to_rlbot,
 };
 
+/// Reasons a RocketSim car cannot become an RLBot [`PlayerInfo`].
+///
+/// These are configuration mismatches, not simulation failures: the car index
+/// has no match-config entry, the teams disagree, or the hitbox disagrees
+/// with the configured car product ID.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum ToRlbotError {
+    /// `player_configurations` is shorter than the arena: car `N` needs
+    /// `player_configurations[N]`. Add the missing entry.
     #[error("RocketSim car {car_index} has no corresponding MatchConfiguration player")]
     MissingPlayerConfiguration { car_index: usize },
+    /// The arena team and the match-config team disagree for this car. Fix
+    /// whichever side is stale.
     #[error(
         "RocketSim car {car_index} is on team {rocketsim_team}, but MatchConfiguration uses team {configured_team}"
     )]
@@ -21,29 +79,70 @@ pub enum ToRlbotError {
         rocketsim_team: u32,
         configured_team: u32,
     },
+    /// The arena hitbox is not the family mapped from `product_id` (see
+    /// [`car_body_config_for_product_id`]).
+    /// Usually a wrong `car_id` in the loadout.
     #[error(
         "RocketSim car {car_index} body config disagrees with configured product ID {product_id}"
     )]
     BodyConfigMismatch { car_index: usize, product_id: u32 },
+    /// The loadout names a car ID this crate does not map yet. Report it so
+    /// the table in [`body`](crate::body) can grow.
     #[error("player {player_id} uses unknown car product ID {product_id}")]
     UnknownCarProductId { player_id: i32, product_id: u32 },
 }
 
+/// Packet-derived timing that a bare [`CarState`] forgets.
+///
+/// [`GameStateEnricher`](crate::GameStateEnricher) maintains this for you;
+/// read it back with `car_conversion_history(_by_player_id)` and hand it to
+/// [`car_to_player_info_with_history`] for an exact trip back to RLBot.
+/// `Default` (all zeros/`false`) means "no history", which is exactly what the
+/// stateless converters use.
+///
+/// # Example
+///
+/// ```rust
+/// # use rlbot_rocketsim::CarConversionHistory;
+/// let history = CarConversionHistory {
+///     initial_jump_duration: 0.12,
+///     double_jump_active: true,
+///     flip_reset_available: false,
+/// };
+/// assert!(history.initial_jump_duration <= 0.2);
+/// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CarConversionHistory {
-    /// Duration of the initial jump force, clamped to Rocket League's 0.2-second maximum.
+    /// How long jump was held, in seconds (clamped to 0.0–0.2 on use).
+    /// Rebuilds the hold extension inside RLBot `dodge_timeout`.
     pub initial_jump_duration: f32,
-    /// Whether the latest authoritative RLBot packet reports active double-jump forces.
+    /// Whether the latest packet reported active double-jump forces. Needed
+    /// because `CarState.has_double_jumped` alone cannot distinguish a fresh
+    /// double jump from an old one.
     pub double_jump_active: bool,
-    /// Whether an airborne player has an untimed RLBot flip reset available.
+    /// Whether an airborne car has an untimed flip reset. While set,
+    /// `dodge_timeout` stays `-1` (no dodge window is running).
     pub flip_reset_available: bool,
 }
 
-/// Converts a car state without packet-derived conversion history.
+/// Converts one (`CarInfo`, `CarState`) pair without retained history.
 ///
-/// This is conservative: it cannot exactly recover RLBot's active
-/// `DoubleJumping` state or the initial-jump hold extension in `dodge_timeout`.
-/// Use [`car_to_player_info_with_history`] when retained history is available.
+/// Shorthand for [`car_to_player_info`]. See the module docs for when to
+/// prefer [`car_to_player_info_with_history`].
+///
+/// # Example
+///
+/// ```rust
+/// # use rlbot_rocketsim::rlbot::flat::{CustomBot, PlayerClass, PlayerConfiguration, PlayerLoadout};
+/// # use rlbot_rocketsim::rocketsim::{Arena, CarBodyConfig, GameMode, Team};
+/// # use rlbot_rocketsim::to_rlbot::CarInfoExt;
+/// # let arena = Arena::new(GameMode::TheVoid);
+/// # let mut arena = arena; let car = arena.add_car(Team::Blue, CarBodyConfig::OCTANE);
+/// # let (info, state) = arena.get_car_info_and_state(car);
+/// # let config = PlayerConfiguration { variety: PlayerClass::CustomBot(Box::new(CustomBot { name: "E".into(), loadout: Some(Box::new(PlayerLoadout { car_id: 23, ..Default::default() })), ..Default::default() })), team: 0, player_id: 7 };
+/// let player = info.to_rlbot_player_info(state, &config).unwrap();
+/// assert_eq!(player.team, 0);
+/// ```
 pub trait CarInfoExt {
     fn to_rlbot_player_info(
         &self,
@@ -62,32 +161,67 @@ impl CarInfoExt for CarInfo {
     }
 }
 
-/// Stateless RocketSim-to-RLBot conversion helpers.
+/// Converts whole arenas to RLBot players, with or without history.
 ///
-/// These methods cannot recover packet-derived `CarConversionHistory`; use
-/// [`car_to_player_info_with_history`] for packet-equivalent conversion.
+/// The stateless methods index `MatchConfiguration.player_configurations` by
+/// RocketSim car index (`players[N]` ↔ car `N`). The history-aware method
+/// takes one [`CarConversionHistory`] per car in the same order; short slices
+/// fall back to stateless conversion per car.
+///
+/// # Example
+///
+/// ```rust
+/// # use rlbot_rocketsim::rlbot::flat::{CustomBot, MatchConfiguration, PlayerClass, PlayerConfiguration, PlayerLoadout};
+/// # use rlbot_rocketsim::rocketsim::{Arena, CarBodyConfig, GameMode, Team};
+/// # use rlbot_rocketsim::to_rlbot::ArenaExt;
+/// # let mut arena = Arena::new(GameMode::TheVoid);
+/// # arena.add_car(Team::Blue, CarBodyConfig::OCTANE);
+/// # let match_config = MatchConfiguration { player_configurations: vec![PlayerConfiguration { variety: PlayerClass::CustomBot(Box::new(CustomBot { name: "E".into(), loadout: Some(Box::new(PlayerLoadout { car_id: 23, ..Default::default() })), ..Default::default() })), team: 0, player_id: 7 }], ..Default::default() };
+/// let players = arena.to_rlbot_players(&match_config).unwrap();
+/// assert_eq!(players.len(), 1);
+/// ```
 pub trait ArenaExt {
-    /// Converts a car using `MatchConfiguration.player_configurations[CarInfo::idx]`.
+    /// Converts one car, looking up its config at
+    /// `MatchConfiguration.player_configurations[CarInfo::idx]`.
     ///
-    /// This is stateless and therefore conservative for history-dependent fields.
+    /// Stateless: exact for physics/boost/inputs, conservative for
+    /// `AirState::DoubleJumping` and the jump-hold part of `dodge_timeout`.
     fn car_to_rlbot_player_info(
         &self,
         car_index: usize,
         match_config: &MatchConfiguration,
     ) -> Result<PlayerInfo, ToRlbotError>;
 
-    /// Converts all cars in RocketSim index order without conversion history.
+    /// Converts every car in index order without history.
     ///
-    /// The resulting vector is suitable for `GamePacket.players` with `players[N]`
-    /// corresponding to car N, but cannot exactly represent history-dependent fields.
+    /// Suitable for `GamePacket.players` (`players[N]` ↔ car `N`), with the
+    /// same conservative jump-timing caveats as
+    /// [`car_to_player_info`].
     fn to_rlbot_players(
         &self,
         match_config: &MatchConfiguration,
     ) -> Result<Vec<PlayerInfo>, ToRlbotError>;
 
-    /// Converts all cars with one retained history value per RocketSim car.
+    /// Converts every car with its retained history (`histories[car_index]`).
     ///
-    /// Missing history values use conservative stateless conversion.
+    /// Missing entries default to stateless conversion, so you can pass a
+    /// shorter slice while migrating. For exact results, pass the histories
+    /// from `GameStateEnricher::car_conversion_history` in car order.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use rlbot_rocketsim::rlbot::flat::{CustomBot, MatchConfiguration, PlayerClass, PlayerConfiguration, PlayerLoadout};
+    /// # use rlbot_rocketsim::rocketsim::{Arena, CarBodyConfig, GameMode, Team};
+    /// # use rlbot_rocketsim::to_rlbot::ArenaExt;
+    /// # use rlbot_rocketsim::CarConversionHistory;
+    /// # let mut arena = Arena::new(GameMode::TheVoid);
+    /// # arena.add_car(Team::Blue, CarBodyConfig::OCTANE);
+    /// # let match_config = MatchConfiguration { player_configurations: vec![PlayerConfiguration { variety: PlayerClass::CustomBot(Box::new(CustomBot { name: "E".into(), loadout: Some(Box::new(PlayerLoadout { car_id: 23, ..Default::default() })), ..Default::default() })), team: 0, player_id: 7 }], ..Default::default() };
+    /// let histories = vec![CarConversionHistory::default()];
+    /// let players = arena.to_rlbot_players_with_history(&match_config, &histories).unwrap();
+    /// assert_eq!(players.len(), 1);
+    /// ```
     fn to_rlbot_players_with_history(
         &self,
         match_config: &MatchConfiguration,
@@ -140,11 +274,27 @@ impl ArenaExt for Arena {
     }
 }
 
-/// Converts a car without packet-derived conversion history.
+/// Converts one car without retained history (conservative jump timing).
 ///
-/// This is conservative for RLBot fields that a bare [`CarState`] cannot represent
-/// exactly. Use [`car_to_player_info_with_history`] when retained packet history is
-/// available.
+/// Physics, boost, inputs, demolition, and dodge direction round-trip;
+/// `AirState::Jumping`/`Dodging` win over `OnGround`, and ground state comes
+/// from RocketSim wheels. `dodge_timeout` assumes a zero jump hold, so a
+/// finite result is a lower bound and `-1` may hide an unknown hold extension.
+/// Use [`car_to_player_info_with_history`] when you kept the enricher history.
+///
+/// # Example
+///
+/// ```rust
+/// # use rlbot_rocketsim::rlbot::flat::{CustomBot, PlayerClass, PlayerConfiguration, PlayerLoadout};
+/// # use rlbot_rocketsim::rocketsim::{Arena, CarBodyConfig, GameMode, Team};
+/// # use rlbot_rocketsim::to_rlbot::car_to_player_info;
+/// # let mut arena = Arena::new(GameMode::TheVoid);
+/// # let car = arena.add_car(Team::Blue, CarBodyConfig::OCTANE);
+/// # let (info, state) = arena.get_car_info_and_state(car);
+/// # let config = PlayerConfiguration { variety: PlayerClass::CustomBot(Box::new(CustomBot { name: "E".into(), loadout: Some(Box::new(PlayerLoadout { car_id: 23, ..Default::default() })), ..Default::default() })), team: 0, player_id: 7 };
+/// let player = car_to_player_info(info, state, &config).unwrap();
+/// assert_eq!(player.player_id, 7);
+/// ```
 pub fn car_to_player_info(
     info: &CarInfo,
     state: &CarState,
@@ -153,6 +303,29 @@ pub fn car_to_player_info(
     car_to_player_info_with_history(info, state, player_config, CarConversionHistory::default())
 }
 
+/// Converts one car with retained [`CarConversionHistory`] for exact timing.
+///
+/// On top of [`car_to_player_info`], this restores the initial-jump hold
+/// extension inside `dodge_timeout`, reports a transient `DoubleJumping` air
+/// state, and keeps `dodge_timeout` at `-1` while a flip reset is available.
+/// Histories are clamped (hold to 0.0–0.2 s), so stale values degrade
+/// gracefully instead of panicking.
+///
+/// # Example
+///
+/// ```rust
+/// # use rlbot_rocketsim::rlbot::flat::{CustomBot, PlayerClass, PlayerConfiguration, PlayerLoadout};
+/// # use rlbot_rocketsim::rocketsim::{Arena, CarBodyConfig, GameMode, Team};
+/// # use rlbot_rocketsim::to_rlbot::car_to_player_info_with_history;
+/// # use rlbot_rocketsim::CarConversionHistory;
+/// # let mut arena = Arena::new(GameMode::TheVoid);
+/// # let car = arena.add_car(Team::Blue, CarBodyConfig::OCTANE);
+/// # let (info, state) = arena.get_car_info_and_state(car);
+/// # let config = PlayerConfiguration { variety: PlayerClass::CustomBot(Box::new(CustomBot { name: "E".into(), loadout: Some(Box::new(PlayerLoadout { car_id: 23, ..Default::default() })), ..Default::default() })), team: 0, player_id: 7 };
+/// let history = CarConversionHistory { initial_jump_duration: 0.1, ..Default::default() };
+/// let player = car_to_player_info_with_history(info, state, &config, history).unwrap();
+/// assert_eq!(player.player_id, 7);
+/// ```
 pub fn car_to_player_info_with_history(
     info: &CarInfo,
     state: &CarState,

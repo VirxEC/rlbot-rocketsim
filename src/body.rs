@@ -1,9 +1,39 @@
+//! Maps RLBot car product IDs to RocketSim hitbox families.
+//!
+//! Bots pick cars by numeric `car_id` in their loadout; RocketSim only cares
+//! about the hitbox family ([Octane, Dominus, ...](rocketsim::CarBodyConfig)).
+//! This lookup bridges the two. Unknown IDs return `None` so callers can
+//! report [`UnknownCarProductId`](crate::match_context::MatchContextError)
+//! instead of guessing a hitbox.
+//!
+//! ```rust
+//! use rlbot_rocketsim::body::car_body_config_for_product_id;
+//! use rlbot_rocketsim::rocketsim::CarBodyConfig;
+//!
+//! assert_eq!(car_body_config_for_product_id(23), Some(CarBodyConfig::OCTANE));
+//! assert_eq!(car_body_config_for_product_id(29), Some(CarBodyConfig::DOMINUS));
+//! assert_eq!(car_body_config_for_product_id(u32::MAX), None);
+//! ```
+
 use rocketsim::CarBodyConfig;
 
-/// Maps Rocket League body product IDs to RocketSim hitbox families.
+/// Looks up the RocketSim hitbox family for an RLBot car product ID.
+///
+/// Returns `None` for IDs this crate does not know yet. Representative IDs:
+/// Octane `23`, Dominus `29`, Breakout `22`, Merc `30`, Plank `24`, Hybrid
+/// `28`. Humans have no loadout, so they skip this lookup and resolve their
+/// hitbox from packet dimensions instead.
 ///
 /// Adapted from VirxEC/replay-to-rocketsim `src/body.rs` at commit
 /// 320c5f0b13c43fe3a3b93df358b8669ff611975d (MIT license).
+///
+/// # Example
+///
+/// ```rust
+/// # use rlbot_rocketsim::body::car_body_config_for_product_id;
+/// # use rlbot_rocketsim::rocketsim::CarBodyConfig;
+/// assert_eq!(car_body_config_for_product_id(22), Some(CarBodyConfig::BREAKOUT));
+/// ```
 #[must_use]
 pub const fn car_body_config_for_product_id(product_id: u32) -> Option<CarBodyConfig> {
     match product_id {

@@ -7,6 +7,34 @@ use thiserror::Error;
 
 use crate::body::car_body_config_for_product_id;
 
+/// Static match setup shared by every packet in a Soccar game.
+///
+/// Built once from [`MatchConfiguration`] (game mode + players) and
+/// [`FieldInfo`] (boost-pad layout). The enricher clones it into an
+/// [`Arena`] and then checks each packet against it: same
+/// participants, same teams, matching hitboxes, and matching pad counts.
+///
+/// Currently only Soccar is supported; anything else returns
+/// [`MatchContextError::UnsupportedGameMode`].
+///
+/// # Example
+///
+/// ```rust
+/// use rlbot_rocketsim::rlbot::flat::{FieldInfo, GameMode, MatchConfiguration};
+/// use rlbot_rocketsim::rocketsim::init_from_default;
+/// use rlbot_rocketsim::{GameStateEnricher, MatchContext};
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// init_from_default(true)?;
+/// let match_config = MatchConfiguration {
+///     game_mode: GameMode::Soccar,
+///     ..Default::default()
+/// };
+/// let context = MatchContext::new(&match_config, &FieldInfo::default()).unwrap();
+/// let enricher = GameStateEnricher::from_match_context(context);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone, Debug)]
 pub struct MatchContext {
     arena_config: ArenaConfig,
@@ -20,33 +48,62 @@ struct ConfiguredPlayer {
     body_config: Option<CarBodyConfig>,
 }
 
+/// Reasons static match data (or a packet checked against it) is unusable.
+///
+/// surfacing which `player_id` / `player_index` failed keeps bot logs
+/// actionable when a lobby changes cars mid-session.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum MatchContextError {
+    /// Only `Soccar` is supported. Fails fast in [`MatchContext::new`] so a
+    /// Dropshot/Rumble lobby never silently enriches with the wrong physics.
     #[error("unsupported RLBot game mode {0:?}")]
     UnsupportedGameMode(RlbotGameMode),
+    /// The loadout names a car ID with no known hitbox family. See
+    /// [`body`](crate::body) for the mapped IDs.
     #[error("player {player_id} uses unknown car product ID {product_id}")]
     UnknownCarProductId { player_id: i32, product_id: u32 },
+    /// Two match-config entries share a `player_id`. IDs must be unique to
+    /// track participants across packets.
     #[error("MatchConfiguration contains duplicate participant ID {player_id}")]
     DuplicatePlayerId { player_id: i32 },
+    /// A human (no loadout) sent a hitbox that matches no known
+    /// [`CarBodyConfig`] within tolerance.
     #[error("packet player {player_index} with participant ID {player_id} has an unknown hitbox")]
     UnknownPacketHitbox { player_index: usize, player_id: i32 },
+    /// The packet contains a `player_id` absent from the match configuration.
+    /// Rebuild the [`MatchContext`] when the lobby changes.
     #[error(
         "packet player {player_index} with participant ID {player_id} is absent from MatchConfiguration"
     )]
     PlayerNotConfigured { player_index: usize, player_id: i32 },
+    /// The packet team differs from the configured team for this `player_id`.
     #[error(
         "packet player {player_index} with participant ID {player_id} has a different team than MatchConfiguration"
     )]
     ConfiguredTeamMismatch { player_index: usize, player_id: i32 },
+    /// The packet hitbox disagrees with the configured product ID (tolerance
+    /// 0.25 uu per dimension). Usually a mid-session car change.
     #[error(
         "packet player {player_index} with participant ID {player_id} has a hitbox that disagrees with its configured car product ID"
     )]
     HitboxMismatch { player_index: usize, player_id: i32 },
+    /// `GamePacket.boost_pads.len()` must equal the arena pad count, or pads
+    /// would silently shift indices.
     #[error("packet has {packet} boost pads but the RocketSim arena has {arena}")]
     BoostPadCountMismatch { packet: usize, arena: usize },
 }
 
 impl MatchContext {
+    /// Snapshots the arena config and per-player bodies for a match.
+    ///
+    /// Empty `FieldInfo.boost_pads` keeps the default Soccar pads; otherwise
+    /// each pad's position and `is_full_boost` flag becomes a RocketSim
+    /// [`BoostPadConfig`]. Duplicate
+    /// `player_id`s and unknown car product IDs fail here instead of at the
+    /// first packet.
+    ///
+    /// Humans (no loadout) resolve their hitbox from the first packet they
+    /// appear in; bots resolve it now from their product ID.
     pub fn new(
         match_config: &MatchConfiguration,
         field_info: &FieldInfo,
@@ -85,6 +142,11 @@ impl MatchContext {
         })
     }
 
+    /// Builds a fresh RocketSim arena with this match's mode and pad layout.
+    ///
+    /// The [`GameStateEnricher`](crate::GameStateEnricher) calls this on
+    /// construction and on every rebuild (departures, team/body changes,
+    /// gravity changes, frame rollbacks).
     #[must_use]
     pub fn create_arena(&self) -> Arena {
         Arena::new_with_config(self.arena_config.clone())

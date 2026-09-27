@@ -1,3 +1,46 @@
+//! Feed RLBot packets into RocketSim and read back enriched car state.
+//!
+//! [`GameStateEnricher`] owns a RocketSim [`Arena`] that
+//! mirrors the match. Each [`GamePacket`] is authoritative for physics,
+//! inputs, boost, and jump/dodge flags; RocketSim only supplies what RLBot
+//! cannot, such as wheel contacts, contact normals, and
+//! [`is_on_ground`](rocketsim::CarState::is_on_ground).
+//!
+//! # Minimal loop
+//!
+//! ```rust
+//! use rlbot_rocketsim::rlbot::flat::{GamePacket, MatchPhase, PlayerInfo};
+//! use rlbot_rocketsim::rocketsim::{Arena, CarBodyConfig, GameMode};
+//! use rlbot_rocketsim::GameStateEnricher;
+//!
+//! let mut enricher =
+//!     GameStateEnricher::new(Arena::new(GameMode::TheVoid), CarBodyConfig::OCTANE);
+//!
+//! let mut packet = GamePacket::default();
+//! packet.match_info.frame_num = 1;
+//! packet.match_info.match_phase = MatchPhase::Active;
+//! packet.players.push(PlayerInfo {
+//!     player_id: 7,
+//!     team: 0,
+//!     demolished_timeout: -1.0,
+//!     dodge_timeout: -1.0,
+//!     ..PlayerInfo::default()
+//! });
+//!
+//! for mapping in enricher.update(&packet).unwrap() {
+//!     // `mapping.player_index` is the `GamePacket.players` slot,
+//!     // `mapping.car_index` is the RocketSim car.
+//!     let car = enricher.car_state(mapping.player_index).unwrap();
+//!     assert_eq!(car.phys.pos.x, 0.0);
+//! }
+//! ```
+//!
+//! For real Soccar matches, build the enricher with
+//! [`GameStateEnricher::from_match_context`] so bodies, boost pads, and the
+//! arena come from [`MatchContext`]. For bots that must
+//! survive reordered packets, look cars up with
+//! [`GameStateEnricher::car_state_by_player_id`] instead of the packet slot.
+
 use glam::Vec3A;
 use rlbot::flat::{AirState, CollisionShape, GamePacket, MatchPhase, PlayerInfo};
 use rocketsim::{
@@ -10,24 +53,61 @@ use crate::common::{MAX_JUMP_HOLD_TIME, controls_from_rlbot, physics_from_rlbot}
 use crate::match_context::{MatchContext, MatchContextError};
 use crate::to_rlbot::CarConversionHistory;
 
+/// Maps one `GamePacket.players` slot to its RocketSim car.
+///
+/// Returned by [`GameStateEnricher::update`] in packet order. `player_index`
+/// is the index into the packet you just fed in; `car_index` is the matching
+/// RocketSim car for [`Arena::get_car_state`](rocketsim::Arena::get_car_state).
+///
+/// # Example
+///
+/// ```rust
+/// # use rlbot_rocketsim::rlbot::flat::{GamePacket, MatchPhase, PlayerInfo};
+/// # use rlbot_rocketsim::rocketsim::{Arena, CarBodyConfig, GameMode};
+/// # use rlbot_rocketsim::GameStateEnricher;
+/// # let mut enricher =
+/// #     GameStateEnricher::new(Arena::new(GameMode::TheVoid), CarBodyConfig::OCTANE);
+/// # let mut packet = GamePacket::default();
+/// # packet.match_info.frame_num = 1;
+/// # packet.match_info.match_phase = MatchPhase::Active;
+/// # packet.players.push(PlayerInfo { player_id: 7, demolished_timeout: -1.0, ..PlayerInfo::default() });
+/// let mappings = enricher.update(&packet).unwrap();
+/// assert_eq!(mappings[0].player_index, 0);
+/// let car = enricher.arena().get_car_state(mappings[0].car_index);
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EnrichedPlayer {
+    /// Index into the `GamePacket.players` slice that produced this mapping.
     pub player_index: usize,
+    /// Index of the corresponding RocketSim car in [`Arena`].
     pub car_index: usize,
 }
 
+/// Reasons [`GameStateEnricher::update`] can reject a packet.
+///
+/// The enricher is unchanged when `update` fails: no cars are added, no
+/// history is reset, and the tick count does not advance.
 #[derive(Debug, Error, PartialEq)]
 pub enum EnrichmentError {
+    /// Static match data disagrees with the packet (unknown body, team or
+    /// hitbox change, boost-pad count mismatch, ...).
     #[error(transparent)]
     MatchContext(#[from] MatchContextError),
+    /// `PlayerInfo.team` was not 0 (blue) or 1 (orange).
     #[error("player at packet index {player_index} has unsupported team index {team}")]
     InvalidTeam { player_index: usize, team: u32 },
+    /// Two packet players share one `player_id`. IDs must be unique because
+    /// they are how the enricher tracks participants across reordered packets.
     #[error("RLBot packet contains duplicate participant ID {player_id}")]
     DuplicatePlayerId { player_id: i32 },
+    /// Context-backed enrichment needs exactly one ball; context-free
+    /// enrichment tolerates an empty `balls` list and leaves the ball alone.
     #[error("expected exactly one RLBot ball, got {count}")]
     BallCount { count: usize },
+    /// Example: a sphere ball in Snowday mode, or a puck outside Snowday.
     #[error("RLBot ball shape {shape} is incompatible with RocketSim mode {mode:?}")]
     BallShape { shape: &'static str, mode: GameMode },
+    /// The sphere diameter differs from the arena's ball by more than 1 uu.
     #[error("RLBot ball diameter {actual} does not match RocketSim diameter {expected}")]
     BallSize { actual: f32, expected: f32 },
 }
@@ -43,8 +123,41 @@ struct TrackedPlayer {
     flip_reset_available: bool,
 }
 
-/// Maintains a RocketSim arena whose cars follow RLBot packets while RocketSim
-/// supplies contact and history-dependent state unavailable from RLBot.
+/// Mirrors RLBot packets in RocketSim and adds contact/history enrichment.
+///
+/// Call [`update`](Self::update) with every new [`GamePacket`]. Packet values
+/// win for physics, boost, and jump/dodge flags; the RocketSim probe only
+/// fills in what the packet cannot describe (wheel contacts, contact normals,
+/// ground state, preserved controls history).
+///
+/// New players join without disturbing existing cars. Leaving players, team or
+/// body changes, gravity changes, and frame rollbacks rebuild the arena
+/// because RocketSim has no car-removal API.
+///
+/// # Example
+///
+/// ```rust
+/// use rlbot_rocketsim::rlbot::flat::{GamePacket, MatchPhase, PlayerInfo};
+/// use rlbot_rocketsim::rocketsim::{Arena, CarBodyConfig, GameMode};
+/// use rlbot_rocketsim::GameStateEnricher;
+///
+/// let mut enricher =
+///     GameStateEnricher::new(Arena::new(GameMode::TheVoid), CarBodyConfig::OCTANE);
+/// let mut packet = GamePacket::default();
+/// packet.match_info.frame_num = 1;
+/// packet.match_info.match_phase = MatchPhase::Active;
+/// packet.players.push(PlayerInfo {
+///     player_id: 7,
+///     team: 0,
+///     demolished_timeout: -1.0,
+///     dodge_timeout: -1.0,
+///     ..PlayerInfo::default()
+/// });
+///
+/// enricher.update(&packet).unwrap();
+/// // Stable across packet reorderings:
+/// assert!(enricher.car_state_by_player_id(7).is_some());
+/// ```
 pub struct GameStateEnricher {
     arena: Arena,
     arena_config: ArenaConfig,
@@ -56,6 +169,22 @@ pub struct GameStateEnricher {
 }
 
 impl GameStateEnricher {
+    /// Creates an enricher around your own arena; every packet car uses
+    /// `body_config`.
+    ///
+    /// Prefer [`from_match_context`](Self::from_match_context) for real
+    /// matches so each car gets its configured hitbox. Use this constructor
+    /// for tests and for arenas (like `TheVoid`) that have no match data.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use rlbot_rocketsim::rocketsim::{Arena, CarBodyConfig, GameMode};
+    /// # use rlbot_rocketsim::GameStateEnricher;
+    /// let mut enricher =
+    ///     GameStateEnricher::new(Arena::new(GameMode::TheVoid), CarBodyConfig::OCTANE);
+    /// assert_eq!(enricher.arena().num_cars(), 0);
+    /// ```
     #[must_use]
     pub fn new(arena: Arena, body_config: CarBodyConfig) -> Self {
         let arena_config = arena.get_config().clone();
@@ -70,6 +199,26 @@ impl GameStateEnricher {
         }
     }
 
+    /// Creates an enricher from static match data (game mode, boost pads,
+    /// configured bodies).
+    ///
+    /// This is the recommended path for Soccar bots: the arena, pad layout,
+    /// and per-player hitboxes all come from [`MatchContext`], and later
+    /// packets are validated against that configuration.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use rlbot_rocketsim::rlbot::flat::{FieldInfo, GameMode, MatchConfiguration};
+    /// # use rlbot_rocketsim::{GameStateEnricher, MatchContext};
+    /// # use rlbot_rocketsim::rocketsim::init_from_default;
+    /// # init_from_default(true).unwrap();
+    /// # let match_config = MatchConfiguration { game_mode: GameMode::Soccar, ..Default::default() };
+    /// # let field_info = FieldInfo::default();
+    /// let context = MatchContext::new(&match_config, &field_info).unwrap();
+    /// let enricher = GameStateEnricher::from_match_context(context);
+    /// assert_eq!(enricher.arena().num_cars(), 0);
+    /// ```
     #[must_use]
     pub fn from_match_context(context: MatchContext) -> Self {
         let arena_config = context.arena_config().clone();
@@ -85,29 +234,59 @@ impl GameStateEnricher {
         }
     }
 
+    /// Borrows the underlying RocketSim arena (cars, ball, pads, tick count).
+    ///
+    /// Use this for contact queries, raycasts, or stepping your own copies.
+    /// Do not mutate through it when you want the next [`update`](Self::update)
+    /// to stay packet-authoritative; use [`arena_mut`](Self::arena_mut) only
+    /// for deliberate local experiments.
     #[must_use]
     pub const fn arena(&self) -> &Arena {
         &self.arena
     }
 
+    /// Mutably borrows the underlying arena, e.g. to inspect or tweak a probe.
+    ///
+    /// The next [`update`](Self::update) overwrites car/ball state with the
+    /// packet again, but preserves RocketSim-derived contacts.
     pub const fn arena_mut(&mut self) -> &mut Arena {
         &mut self.arena
     }
 
+    /// Snapshots every car and the ball after the latest enrichment.
     #[must_use]
     pub fn arena_state(&self) -> ArenaState {
         self.arena.get_arena_state()
     }
 
+    /// Borrows the enriched ball. Without a [`MatchContext`], an empty
+    /// `GamePacket.balls` list leaves a previous ball untouched.
     #[must_use]
     pub const fn ball_state(&self) -> &BallState {
         self.arena.get_ball_state()
     }
 
-    /// Returns the enriched car state for a slot in the latest `GamePacket.players`.
+    /// Returns the enriched car for a `GamePacket.players` slot.
     ///
-    /// Packet slots can change when player order changes; use
-    /// [`Self::car_state_by_player_id`] for stable participant identity.
+    /// Returns `None` for an out-of-range slot. Slots reorder when players
+    /// join or the server reorders them, so for anything stored across
+    /// packets use [`car_state_by_player_id`](Self::car_state_by_player_id).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use rlbot_rocketsim::rlbot::flat::{GamePacket, MatchPhase, PlayerInfo};
+    /// # use rlbot_rocketsim::rocketsim::{Arena, CarBodyConfig, GameMode};
+    /// # use rlbot_rocketsim::GameStateEnricher;
+    /// # let mut enricher = GameStateEnricher::new(Arena::new(GameMode::TheVoid), CarBodyConfig::OCTANE);
+    /// # let mut packet = GamePacket::default();
+    /// # packet.match_info.frame_num = 1;
+    /// # packet.match_info.match_phase = MatchPhase::Active;
+    /// # packet.players.push(PlayerInfo { player_id: 7, demolished_timeout: -1.0, ..PlayerInfo::default() });
+    /// # enricher.update(&packet).unwrap();
+    /// assert!(enricher.car_state(0).is_some());
+    /// assert!(enricher.car_state(99).is_none());
+    /// ```
     #[must_use]
     pub fn car_state(&self, packet_player_index: usize) -> Option<&CarState> {
         self.players
@@ -115,7 +294,27 @@ impl GameStateEnricher {
             .map(|player| self.arena.get_car_state(player.car_index))
     }
 
-    /// Returns the enriched car state for an RLBot participant ID.
+    /// Returns the enriched car for a stable RLBot `player_id`.
+    ///
+    /// Unlike [`car_state`](Self::car_state), this lookup survives packet
+    /// reorderings because the enricher keys participants by ID internally.
+    /// Returns `None` when that participant was absent from the latest packet.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use rlbot_rocketsim::rlbot::flat::{GamePacket, MatchPhase, PlayerInfo};
+    /// # use rlbot_rocketsim::rocketsim::{Arena, CarBodyConfig, GameMode};
+    /// # use rlbot_rocketsim::GameStateEnricher;
+    /// # let mut enricher = GameStateEnricher::new(Arena::new(GameMode::TheVoid), CarBodyConfig::OCTANE);
+    /// # let mut packet = GamePacket::default();
+    /// # packet.match_info.frame_num = 1;
+    /// # packet.match_info.match_phase = MatchPhase::Active;
+    /// # packet.players.push(PlayerInfo { player_id: 42, demolished_timeout: -1.0, ..PlayerInfo::default() });
+    /// # enricher.update(&packet).unwrap();
+    /// assert!(enricher.car_state_by_player_id(42).is_some());
+    /// assert!(enricher.car_state_by_player_id(7).is_none());
+    /// ```
     #[must_use]
     pub fn car_state_by_player_id(&self, player_id: i32) -> Option<&CarState> {
         self.players
@@ -124,10 +323,14 @@ impl GameStateEnricher {
             .map(|player| self.arena.get_car_state(player.car_index))
     }
 
-    /// Returns conversion history for a slot in the latest `GamePacket.players`.
+    /// Returns the retained [`CarConversionHistory`] for a packet slot.
     ///
-    /// Packet slots can change when player order changes; use
-    /// [`Self::car_conversion_history_by_player_id`] for stable participant identity.
+    /// Feed this into
+    /// [`car_to_player_info_with_history`](crate::to_rlbot::car_to_player_info_with_history)
+    /// to convert back to RLBot without losing the initial-jump hold time or
+    /// a transient `DoubleJumping` state. Slots reorder; prefer
+    /// [`car_conversion_history_by_player_id`](Self::car_conversion_history_by_player_id)
+    /// for stored lookups.
     #[must_use]
     pub fn car_conversion_history(
         &self,
@@ -138,7 +341,11 @@ impl GameStateEnricher {
             .map(car_conversion_history)
     }
 
-    /// Returns the conversion history for an RLBot participant ID.
+    /// Returns the retained [`CarConversionHistory`] for a stable `player_id`.
+    ///
+    /// This is the history-aware counterpart to
+    /// [`car_state_by_player_id`](Self::car_state_by_player_id): it keeps
+    /// working when `GamePacket.players` is reordered between frames.
     #[must_use]
     pub fn car_conversion_history_by_player_id(
         &self,
@@ -150,20 +357,46 @@ impl GameStateEnricher {
             .map(car_conversion_history)
     }
 
-    /// Returns retained initial-jump duration for a slot in the latest packet.
+    /// Returns the retained initial-jump hold time (seconds, max 0.2) for a slot.
     ///
-    /// Packet slots can change when player order changes.
+    /// This is a shortcut for `car_conversion_history(slot).initial_jump_duration`.
+    /// It feeds the `dodge_timeout` reconstruction on the way back to RLBot.
+    /// Slots reorder, so treat the result as valid only for the latest packet.
     #[must_use]
     pub fn initial_jump_duration(&self, packet_player_index: usize) -> Option<f32> {
         self.car_conversion_history(packet_player_index)
             .map(|history| history.initial_jump_duration)
     }
 
-    /// Synchronizes packet-authoritative state, advances RocketSim once to derive
-    /// enrichment for a new active frame, and restores packet values.
+    /// Applies one packet and returns per-slot [`EnrichedPlayer`] mappings.
     ///
-    /// Player additions preserve existing history. Departures and immutable car
-    /// changes rebuild the arena because RocketSim does not expose car removal.
+    /// What happens per call:
+    /// 1. Validates teams, duplicate IDs, ball shape/size, and (with a
+    ///    [`MatchContext`]) bodies and boost-pad counts.
+    /// 2. On a new `Kickoff`/`Active` frame, probes RocketSim once with the
+    ///    packet inputs to refresh contacts. Other phases, repeated frames,
+    ///    and frame gaps never step more than once.
+    /// 3. Restores packet physics/boost/jump state on top of the probe, keeps
+    ///    RocketSim contacts, and records jump history for the trip back.
+    ///
+    /// New `player_id`s join in place; removals, team/body changes, gravity
+    /// changes, and frame rollbacks rebuild the arena. On error the enricher
+    /// is left untouched.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use rlbot_rocketsim::rlbot::flat::{GamePacket, MatchPhase, PlayerInfo};
+    /// # use rlbot_rocketsim::rocketsim::{Arena, CarBodyConfig, GameMode};
+    /// # use rlbot_rocketsim::GameStateEnricher;
+    /// # let mut enricher = GameStateEnricher::new(Arena::new(GameMode::TheVoid), CarBodyConfig::OCTANE);
+    /// # let mut packet = GamePacket::default();
+    /// # packet.match_info.frame_num = 1;
+    /// # packet.match_info.match_phase = MatchPhase::Active;
+    /// # packet.players.push(PlayerInfo { player_id: 7, demolished_timeout: -1.0, ..PlayerInfo::default() });
+    /// let mappings = enricher.update(&packet).unwrap();
+    /// assert_eq!(mappings.len(), 1);
+    /// ```
     pub fn update(&mut self, packet: &GamePacket) -> Result<Vec<EnrichedPlayer>, EnrichmentError> {
         let plan = self.build_update_plan(packet)?;
         Ok(self.apply_update_plan(plan))
