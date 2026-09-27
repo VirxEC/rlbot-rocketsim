@@ -6,6 +6,7 @@ use rlbot_rocketsim::rocketsim::{
     Arena, CarBodyConfig, CarControls, CarState, GameMode, PhysState, Team, init_from_default,
 };
 use rlbot_rocketsim::to_rlbot::ArenaExt;
+use rocketsim::{RaycastHitInfo, UserInfoType};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_from_default(true)?;
@@ -28,7 +29,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             boost: 62.0,
             is_on_ground: true,
-            wheels_with_contact: [true; 4],
+            wheels_with_contact: [Some(RaycastHitInfo {
+                hit_point: Vec3A::ZERO,
+                hit_normal: Vec3A::Z,
+                hit_fraction: 0.0,
+                user_info: UserInfoType::None,
+            }); 4],
             ..CarState::default()
         },
     );

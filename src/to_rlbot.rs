@@ -278,10 +278,18 @@ fn player_name_and_bot(player_class: &PlayerClass, player_index: usize) -> (Stri
 
 #[cfg(test)]
 mod tests {
+    use glam::Vec3A;
     use rlbot::flat::{CustomBot, PlayerLoadout};
-    use rocketsim::{CarBodyConfig, Team, consts};
+    use rocketsim::{CarBodyConfig, RaycastHitInfo, Team, UserInfoType, consts};
 
     use super::*;
+
+    const DEFAULT_RAYCAST_HIT_INFO: RaycastHitInfo = RaycastHitInfo {
+        hit_point: Vec3A::ZERO,
+        hit_normal: Vec3A::Z,
+        hit_fraction: 0.0,
+        user_info: UserInfoType::None,
+    };
 
     fn player(team: u32, car_id: u32) -> PlayerConfiguration {
         PlayerConfiguration {
@@ -306,7 +314,7 @@ mod tests {
             config: CarBodyConfig::OCTANE,
         };
         let mut state = CarState {
-            wheels_with_contact: [true; 4],
+            wheels_with_contact: [Some(DEFAULT_RAYCAST_HIT_INFO); 4],
             is_on_ground: true,
             is_jumping: true,
             ..CarState::default()
@@ -330,7 +338,12 @@ mod tests {
         };
         let state = CarState {
             is_on_ground: true,
-            wheels_with_contact: [true, true, true, false],
+            wheels_with_contact: [
+                Some(DEFAULT_RAYCAST_HIT_INFO),
+                Some(DEFAULT_RAYCAST_HIT_INFO),
+                Some(DEFAULT_RAYCAST_HIT_INFO),
+                None,
+            ],
             has_flipped: true,
             flip_time: 0.4,
             ..CarState::default()
@@ -350,7 +363,7 @@ mod tests {
         };
         let state = CarState {
             is_on_ground: false,
-            wheels_with_contact: [false; 4],
+            wheels_with_contact: [None; 4],
             has_jumped: true,
             jump_ticks: (0.65 * consts::TICK_RATE) as u32,
             air_time_since_jump: 0.45,

@@ -30,7 +30,7 @@ fn derives_no_wheel_contacts_instead_of_copying_ground_air_state() {
 
     enricher.update(&packet).unwrap();
     let state = enricher.car_state(0).unwrap();
-    assert_eq!(state.wheels_with_contact, [false; 4]);
+    assert_eq!(state.wheels_with_contact, [None; 4]);
     assert!(!state.is_on_ground);
     assert_eq!(state.phys.pos.z, 1_000.0);
 }
@@ -66,7 +66,7 @@ fn first_packet_does_not_probe_forward_from_authoritative_state() {
     enricher.update(&packet).unwrap();
 
     let state = enricher.car_state(0).unwrap();
-    assert_eq!(state.wheels_with_contact, [false; 4]);
+    assert_eq!(state.wheels_with_contact, [None; 4]);
     assert!(!state.is_on_ground);
 }
 
@@ -103,7 +103,7 @@ fn derives_ground_state_from_wheel_contacts_despite_in_air_state() {
     }
 
     let state = enricher.car_state(0).unwrap();
-    assert_eq!(state.wheels_with_contact, [true; 4]);
+    assert!(state.wheels_with_contact.iter().all(Option::is_some));
     assert!(state.is_on_ground);
     assert_eq!(state.phys.pos.z, 17.0);
 }
@@ -147,6 +147,6 @@ fn current_packet_uses_contacts_from_the_prior_interval() {
 
     let state = enricher.car_state(0).unwrap();
     assert_eq!(state.phys.pos.z, 17.0);
-    assert_eq!(state.wheels_with_contact, [false; 4]);
+    assert_eq!(state.wheels_with_contact, [None; 4]);
     assert!(!state.is_on_ground);
 }

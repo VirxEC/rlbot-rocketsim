@@ -579,7 +579,7 @@ fn merge_authoritative_player(
 fn preserve_simulated_contacts(simulated: CarState, state: &mut CarState) {
     if state.is_demoed {
         state.is_on_ground = false;
-        state.wheels_with_contact = [false; 4];
+        state.wheels_with_contact = [None; 4];
         state.world_contact_normal = None;
     } else {
         state.is_on_ground = simulated.is_on_ground;
@@ -650,7 +650,9 @@ mod tests {
     use rlbot::flat::{
         BoostPadState as RlbotBoostPadState, GamePacket, MatchPhase, Physics, PlayerInfo, Vector3,
     };
-    use rocketsim::{Arena, CarBodyConfig, GameMode, init_from_default};
+    use rocketsim::{
+        Arena, CarBodyConfig, GameMode, RaycastHitInfo, UserInfoType, init_from_default,
+    };
 
     use super::*;
 
@@ -1037,7 +1039,12 @@ mod tests {
         enricher.update(&packet(1, player())).unwrap();
         let mut prior = *enricher.car_state(0).unwrap();
         prior.is_on_ground = true;
-        prior.wheels_with_contact = [true; 4];
+        prior.wheels_with_contact = [Some(RaycastHitInfo {
+            hit_point: Vec3A::ZERO,
+            hit_normal: Vec3A::Z,
+            hit_fraction: 0.0,
+            user_info: UserInfoType::None,
+        }); 4];
         prior.world_contact_normal = Some(Vec3A::Z);
         enricher.arena_mut().set_car_state(0, prior);
 
@@ -1047,7 +1054,7 @@ mod tests {
         let state = enricher.car_state(0).unwrap();
         assert!(state.is_demoed);
         assert!(!state.is_on_ground);
-        assert_eq!(state.wheels_with_contact, [false; 4]);
+        assert_eq!(state.wheels_with_contact, [None; 4]);
         assert_eq!(state.world_contact_normal, None);
     }
 

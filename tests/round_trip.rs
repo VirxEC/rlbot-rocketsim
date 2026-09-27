@@ -9,6 +9,7 @@ use rlbot_rocketsim::rocketsim::{
     init_from_default,
 };
 use rlbot_rocketsim::to_rlbot::car_to_player_info;
+use rocketsim::{RaycastHitInfo, UserInfoType};
 
 const EPSILON: f32 = 1e-4;
 
@@ -202,7 +203,12 @@ fn grounded_state_and_demo_timer_round_trip() {
     let config = bot_config(9, "Demoed", Team::Blue, 23);
     let original = CarState {
         is_on_ground: true,
-        wheels_with_contact: [true; 4],
+        wheels_with_contact: [Some(RaycastHitInfo {
+            hit_point: Vec3A::ZERO,
+            hit_normal: Vec3A::Z,
+            hit_fraction: 0.0,
+            user_info: UserInfoType::None,
+        }); 4],
         is_demoed: true,
         demo_respawn_timer: 1.75,
         boost: 0.0,
