@@ -611,8 +611,11 @@ impl GameStateEnricher {
             {
                 self.players.remove(position)
             } else {
+                let car_index = self.arena.add_car(planned.team, planned.body_config);
+                // A new car has no measured contacts until the first physics probe.
+                self.arena.reset_car_transient_contacts(car_index);
                 TrackedPlayer {
-                    car_index: self.arena.add_car(planned.team, planned.body_config),
+                    car_index,
                     player_id: planned.player_id,
                     team: planned.team,
                     body_config: planned.body_config,
@@ -645,10 +648,12 @@ impl GameStateEnricher {
     ) {
         for (index, (planned, resolved)) in players.iter().zip(resolved).enumerate() {
             let player = planned.player;
-            let mut simulated = *self.arena.get_car_state(resolved.car_index);
-            simulated.is_on_ground = simulated.num_wheels_in_contact() >= 3;
+            if player.demolished_timeout != -1.0 {
+                self.arena.reset_car_transient_contacts(resolved.car_index);
+            }
+            let simulated = *self.arena.get_car_state(resolved.car_index);
             let previous_controls = if stepped {
-                simulated.prev_controls
+                *simulated.prev_controls()
             } else if reset_history {
                 planned.controls
             } else {
@@ -662,9 +667,7 @@ impl GameStateEnricher {
                 resolved.flip_reset_available,
                 reset_history,
             );
-            let mut state = state;
-            preserve_simulated_contacts(simulated, &mut state);
-            self.arena.set_car_state(resolved.car_index, state);
+            self.arena.set_car_state_full(resolved.car_index, state);
             self.arena
                 .set_car_controls(resolved.car_index, state.controls);
             self.players[index].previous_controls = planned.controls;
@@ -792,10 +795,10 @@ fn merge_authoritative_player(
         initial_jump_duration,
         flip_reset_available,
     );
-    state.prev_controls = previous_controls;
+    state.set_prev_controls(previous_controls);
 
     if reset_history {
-        state.prev_controls = controls;
+        state.set_prev_controls(controls);
         // AirState describes jump/dodge forces, not wheel contact. Leave contact
         // fields under RocketSim's control so its collision state can establish them.
         state.air_time = 0.0;
@@ -807,18 +810,6 @@ fn merge_authoritative_player(
     }
 
     state
-}
-
-fn preserve_simulated_contacts(simulated: CarState, state: &mut CarState) {
-    if state.is_demoed {
-        state.is_on_ground = false;
-        state.wheels_with_contact = [None; 4];
-        state.world_contact_normal = None;
-    } else {
-        state.is_on_ground = simulated.is_on_ground;
-        state.wheels_with_contact = simulated.wheels_with_contact;
-        state.world_contact_normal = simulated.world_contact_normal;
-    }
 }
 
 fn restore_authoritative_player(
@@ -883,9 +874,7 @@ mod tests {
     use rlbot::flat::{
         BoostPadState as RlbotBoostPadState, GamePacket, MatchPhase, Physics, PlayerInfo, Vector3,
     };
-    use rocketsim::{
-        Arena, CarBodyConfig, GameMode, RaycastHitInfo, UserInfoType, init_from_default,
-    };
+    use rocketsim::{Arena, CarBodyConfig, GameMode, init_from_default};
 
     use super::*;
 
@@ -952,10 +941,14 @@ mod tests {
         let second_car = first[1].car_index;
         let mut first_state = *enricher.arena().get_car_state(first_car);
         first_state.handbrake_val = 0.25;
-        enricher.arena_mut().set_car_state(first_car, first_state);
+        enricher
+            .arena_mut()
+            .set_car_state_full(first_car, first_state);
         let mut second_state = *enricher.arena().get_car_state(second_car);
         second_state.handbrake_val = 0.75;
-        enricher.arena_mut().set_car_state(second_car, second_state);
+        enricher
+            .arena_mut()
+            .set_car_state_full(second_car, second_state);
 
         let mut reordered = GamePacket::default();
         reordered.match_info.frame_num = 2;
@@ -982,7 +975,7 @@ mod tests {
         enricher.update(&packet(1, player())).unwrap();
         let mut state = *enricher.car_state(0).unwrap();
         state.handbrake_val = 0.5;
-        enricher.arena_mut().set_car_state(0, state);
+        enricher.arena_mut().set_car_state_full(0, state);
 
         let mut joined = packet(2, player());
         joined.match_info.match_phase = MatchPhase::Paused;
@@ -1034,12 +1027,12 @@ mod tests {
 
         enricher.update(&packet(1, held.clone())).unwrap();
         enricher.update(&packet(2, held.clone())).unwrap();
-        assert!(enricher.car_state(0).unwrap().prev_controls.jump);
+        assert!(enricher.car_state(0).unwrap().prev_controls().jump);
 
         let mut released = held;
         released.last_input.jump = false;
         enricher.update(&packet(3, released)).unwrap();
-        assert!(!enricher.car_state(0).unwrap().prev_controls.jump);
+        assert!(!enricher.car_state(0).unwrap().prev_controls().jump);
     }
 
     #[test]
@@ -1064,7 +1057,7 @@ mod tests {
         enricher.update(&first).unwrap();
         let mut state = *enricher.car_state(0).unwrap();
         state.handbrake_val = 0.5;
-        enricher.arena_mut().set_car_state(0, state);
+        enricher.arena_mut().set_car_state_full(0, state);
 
         let mut changed = packet(2, player());
         changed.match_info.world_gravity_z = 325.0;
@@ -1271,24 +1264,17 @@ mod tests {
         let mut enricher = GameStateEnricher::new(arena, CarBodyConfig::default());
         enricher.update(&packet(1, player())).unwrap();
         let mut prior = *enricher.car_state(0).unwrap();
-        prior.is_on_ground = true;
-        prior.wheels_with_contact = [Some(RaycastHitInfo {
-            hit_point: Vec3A::ZERO,
-            hit_normal: Vec3A::Z,
-            hit_fraction: 0.0,
-            user_info: UserInfoType::None,
-        }); 4];
-        prior.world_contact_normal = Some(Vec3A::Z);
-        enricher.arena_mut().set_car_state(0, prior);
+        prior.set_contact_flags(true, [true; 4]);
+        enricher.arena_mut().set_car_state_full(0, prior);
 
         let mut demoed = player();
         demoed.demolished_timeout = 2.0;
         enricher.update(&packet(2, demoed)).unwrap();
         let state = enricher.car_state(0).unwrap();
         assert!(state.is_demoed);
-        assert!(!state.is_on_ground);
-        assert_eq!(state.wheels_with_contact, [None; 4]);
-        assert_eq!(state.world_contact_normal, None);
+        assert!(!state.is_on_ground());
+        assert_eq!(*state.wheels_with_contact(), [None; 4]);
+        assert_eq!(state.world_contact_normal(), None);
     }
 
     #[test]
@@ -1304,7 +1290,7 @@ mod tests {
         enricher.update(&packet(1, jumping)).unwrap();
         let state = enricher.car_state(0).unwrap();
 
-        assert!(!state.is_on_ground);
+        assert!(!state.is_on_ground());
         assert!(state.is_jumping);
         assert_eq!(state.air_time_since_jump, 0.0);
         assert_eq!(state.flip_time, 0.0);

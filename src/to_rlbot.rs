@@ -340,7 +340,7 @@ pub fn car_to_player_info_with_history(
         AirState::Dodging
     } else if history.double_jump_active && state.has_double_jumped {
         AirState::DoubleJumping
-    } else if state.is_on_ground {
+    } else if state.is_on_ground() {
         AirState::OnGround
     } else {
         AirState::InAir
@@ -392,7 +392,7 @@ pub fn car_to_player_info_with_history(
         has_jumped: state.has_jumped,
         has_double_jumped: state.has_double_jumped,
         has_dodged: state.has_flipped,
-        dodge_elapsed: if state.is_on_ground {
+        dodge_elapsed: if state.is_on_ground() {
             0.0
         } else {
             state.flip_time
@@ -451,18 +451,10 @@ fn player_name_and_bot(player_class: &PlayerClass, player_index: usize) -> (Stri
 
 #[cfg(test)]
 mod tests {
-    use glam::Vec3A;
     use rlbot::flat::{CustomBot, PlayerLoadout};
-    use rocketsim::{CarBodyConfig, RaycastHitInfo, Team, UserInfoType, consts};
+    use rocketsim::{CarBodyConfig, Team, consts};
 
     use super::*;
-
-    const DEFAULT_RAYCAST_HIT_INFO: RaycastHitInfo = RaycastHitInfo {
-        hit_point: Vec3A::ZERO,
-        hit_normal: Vec3A::Z,
-        hit_fraction: 0.0,
-        user_info: UserInfoType::None,
-    };
 
     fn player(team: u32, car_id: u32) -> PlayerConfiguration {
         PlayerConfiguration {
@@ -486,12 +478,9 @@ mod tests {
             team: Team::Blue,
             config: CarBodyConfig::OCTANE,
         };
-        let mut state = CarState {
-            wheels_with_contact: [Some(DEFAULT_RAYCAST_HIT_INFO); 4],
-            is_on_ground: true,
-            is_jumping: true,
-            ..CarState::default()
-        };
+        let mut state = CarState::default();
+        state.set_contact_flags(true, [true; 4]);
+        state.is_jumping = true;
 
         let jumping = car_to_player_info(&info, &state, &player(0, 23)).unwrap();
         assert_eq!(jumping.air_state, AirState::Jumping);
@@ -509,18 +498,10 @@ mod tests {
             team: Team::Blue,
             config: CarBodyConfig::OCTANE,
         };
-        let state = CarState {
-            is_on_ground: true,
-            wheels_with_contact: [
-                Some(DEFAULT_RAYCAST_HIT_INFO),
-                Some(DEFAULT_RAYCAST_HIT_INFO),
-                Some(DEFAULT_RAYCAST_HIT_INFO),
-                None,
-            ],
-            has_flipped: true,
-            flip_time: 0.4,
-            ..CarState::default()
-        };
+        let mut state = CarState::default();
+        state.set_contact_flags(true, [true, true, true, false]);
+        state.has_flipped = true;
+        state.flip_time = 0.4;
 
         let converted = car_to_player_info(&info, &state, &player(0, 23)).unwrap();
         assert_eq!(converted.air_state, AirState::OnGround);
@@ -534,14 +515,11 @@ mod tests {
             team: Team::Blue,
             config: CarBodyConfig::OCTANE,
         };
-        let state = CarState {
-            is_on_ground: false,
-            wheels_with_contact: [None; 4],
-            has_jumped: true,
-            jump_ticks: (0.65 * consts::TICK_RATE) as u32,
-            air_time_since_jump: 0.45,
-            ..CarState::default()
-        };
+        let mut state = CarState::default();
+        state.set_contact_flags(false, [false; 4]);
+        state.has_jumped = true;
+        state.jump_ticks = (0.65 * consts::TICK_RATE) as u32;
+        state.air_time_since_jump = 0.45;
 
         let conservative = car_to_player_info(&info, &state, &player(0, 23)).unwrap();
         assert!((conservative.dodge_timeout - 0.8).abs() < 1e-5);
@@ -567,13 +545,11 @@ mod tests {
             team: Team::Blue,
             config: CarBodyConfig::OCTANE,
         };
-        let state = CarState {
-            is_on_ground: true,
-            is_jumping: true,
-            has_jumped: true,
-            jump_ticks: (0.1 * consts::TICK_RATE) as u32,
-            ..CarState::default()
-        };
+        let mut state = CarState::default();
+        state.set_contact_flags(true, [true; 4]);
+        state.is_jumping = true;
+        state.has_jumped = true;
+        state.jump_ticks = (0.1 * consts::TICK_RATE) as u32;
 
         let converted = car_to_player_info_with_history(
             &info,
@@ -596,12 +572,10 @@ mod tests {
             team: Team::Blue,
             config: CarBodyConfig::OCTANE,
         };
-        let state = CarState {
-            is_on_ground: false,
-            has_jumped: true,
-            air_time_since_jump: 1.25,
-            ..CarState::default()
-        };
+        let mut state = CarState::default();
+        state.set_contact_flags(false, [false; 4]);
+        state.has_jumped = true;
+        state.air_time_since_jump = 1.25;
 
         let converted = car_to_player_info_with_history(
             &info,
@@ -624,12 +598,10 @@ mod tests {
             team: Team::Blue,
             config: CarBodyConfig::OCTANE,
         };
-        let state = CarState {
-            is_on_ground: false,
-            has_jumped: true,
-            has_double_jumped: true,
-            ..CarState::default()
-        };
+        let mut state = CarState::default();
+        state.set_contact_flags(false, [false; 4]);
+        state.has_jumped = true;
+        state.has_double_jumped = true;
 
         let converted = car_to_player_info_with_history(
             &info,
@@ -652,13 +624,11 @@ mod tests {
             team: Team::Blue,
             config: CarBodyConfig::OCTANE,
         };
-        let state = CarState {
-            is_on_ground: false,
-            has_double_jumped: true,
-            has_flipped: true,
-            is_flipping: true,
-            ..CarState::default()
-        };
+        let mut state = CarState::default();
+        state.set_contact_flags(false, [false; 4]);
+        state.has_double_jumped = true;
+        state.has_flipped = true;
+        state.is_flipping = true;
 
         let converted = car_to_player_info_with_history(
             &info,
@@ -681,13 +651,11 @@ mod tests {
             team: Team::Blue,
             config: CarBodyConfig::OCTANE,
         };
-        let state = CarState {
-            is_on_ground: true,
-            is_jumping: true,
-            has_flipped: true,
-            flip_time: 0.4,
-            ..CarState::default()
-        };
+        let mut state = CarState::default();
+        state.set_contact_flags(true, [true; 4]);
+        state.is_jumping = true;
+        state.has_flipped = true;
+        state.flip_time = 0.4;
 
         let converted = car_to_player_info(&info, &state, &player(0, 23)).unwrap();
         assert_eq!(converted.air_state, AirState::Jumping);

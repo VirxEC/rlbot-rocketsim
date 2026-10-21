@@ -113,13 +113,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .car_state_by_player_id(7)
         .expect("player 7 is present");
     let contacts = car
-        .wheels_with_contact
+        .wheels_with_contact()
         .iter()
         .filter(|w| w.is_some())
         .count();
     println!(
         "wheels in contact: {contacts}/4 (is_on_ground={})",
-        car.is_on_ground
+        car.is_on_ground()
     );
     println!("position kept from packet: {:?}", car.phys.pos);
 

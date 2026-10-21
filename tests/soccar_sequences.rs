@@ -1,4 +1,3 @@
-use glam::Vec3A;
 use rlbot_rocketsim::GameStateEnricher;
 use rlbot_rocketsim::rlbot::flat::{
     AirState, CustomBot, GamePacket, MatchPhase, Physics, PlayerClass, PlayerConfiguration,
@@ -6,7 +5,6 @@ use rlbot_rocketsim::rlbot::flat::{
 };
 use rlbot_rocketsim::rocketsim::{Arena, CarBodyConfig, GameMode, Team};
 use rlbot_rocketsim::to_rlbot::car_to_player_info_with_history;
-use rocketsim::{RaycastHitInfo, UserInfoType};
 
 const TICK_TIME: f32 = 1.0 / 120.0;
 
@@ -254,16 +252,9 @@ fn demolition_and_join_sequence_preserves_only_valid_history() {
         .update(&packet(1, MatchPhase::Active, vec![player(7)]))
         .unwrap();
     let mut state = *enricher.car_state(0).unwrap();
-    state.is_on_ground = true;
-    state.wheels_with_contact = [Some(RaycastHitInfo {
-        hit_point: Vec3A::ZERO,
-        hit_normal: Vec3A::Z,
-        hit_fraction: 0.0,
-        user_info: UserInfoType::None,
-    }); 4];
-    state.world_contact_normal = Some(glam::Vec3A::Z);
+    state.set_contact_flags(true, [true; 4]);
     state.handbrake_val = 0.4;
-    enricher.arena_mut().set_car_state(0, state);
+    enricher.arena_mut().set_car_state_full(0, state);
 
     let mut joined = packet(2, MatchPhase::Paused, vec![player(7), player(9)]);
     enricher.update(&joined).unwrap();
@@ -280,7 +271,7 @@ fn demolition_and_join_sequence_preserves_only_valid_history() {
 
     let demoed = enricher.car_state_by_player_id(7).unwrap();
     assert!(demoed.is_demoed);
-    assert!(!demoed.is_on_ground);
-    assert_eq!(demoed.wheels_with_contact, [None; 4]);
-    assert_eq!(demoed.world_contact_normal, None);
+    assert!(!demoed.is_on_ground());
+    assert_eq!(*demoed.wheels_with_contact(), [None; 4]);
+    assert_eq!(demoed.world_contact_normal(), None);
 }

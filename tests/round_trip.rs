@@ -9,7 +9,6 @@ use rlbot_rocketsim::rocketsim::{
     init_from_default,
 };
 use rlbot_rocketsim::to_rlbot::car_to_player_info;
-use rocketsim::{RaycastHitInfo, UserInfoType};
 
 const EPSILON: f32 = 1e-4;
 
@@ -84,38 +83,34 @@ fn stateless_round_trip_preserves_directly_representable_car_data() {
         team: Team::Orange as u32,
         player_id: 1234,
     };
-    let original = CarState {
-        phys: PhysState {
-            pos: Vec3A::new(250.0, -1_500.0, 17.0),
-            rot_mat: Mat3A::from_euler(EulerRot::ZYX, 0.75, -0.2, 0.1),
-            vel: Vec3A::new(900.0, -400.0, 100.0),
-            ang_vel: Vec3A::new(1.0, -2.0, 3.0),
-        },
-        controls: CarControls {
-            throttle: 0.75,
-            steer: -0.5,
-            pitch: 0.25,
-            yaw: -0.75,
-            roll: 1.0,
-            jump: false,
-            boost: true,
-            handbrake: true,
-        },
-        is_on_ground: false,
-        has_jumped: true,
-        has_double_jumped: false,
-        has_flipped: false,
-        flip_rel_torque: Vec3A::new(-0.6, 0.8, 0.0),
-        flip_time: 0.35,
-        is_flipping: true,
-        is_jumping: false,
-        air_time_since_jump: 0.45,
-        boost: 47.5,
-        is_supersonic: true,
-        is_demoed: false,
-        demo_respawn_timer: 0.0,
-        ..CarState::default()
+    let mut original = CarState::default();
+    original.phys = PhysState {
+        pos: Vec3A::new(250.0, -1_500.0, 17.0),
+        rot_mat: Mat3A::from_euler(EulerRot::ZYX, 0.75, -0.2, 0.1),
+        vel: Vec3A::new(900.0, -400.0, 100.0),
+        ang_vel: Vec3A::new(1.0, -2.0, 3.0),
     };
+    original.controls = CarControls {
+        throttle: 0.75,
+        steer: -0.5,
+        pitch: 0.25,
+        yaw: -0.75,
+        roll: 1.0,
+        jump: false,
+        boost: true,
+        handbrake: true,
+    };
+    original.set_contact_flags(false, [false; 4]);
+    original.has_jumped = true;
+    original.has_double_jumped = false;
+    original.has_flipped = false;
+    original.flip_rel_torque = Vec3A::new(-0.6, 0.8, 0.0);
+    original.flip_time = 0.35;
+    original.is_flipping = true;
+    original.is_jumping = false;
+    original.air_time_since_jump = 0.45;
+    original.boost = 47.5;
+    original.is_supersonic = true;
 
     let player = car_to_player_info(&info, &original, &config).unwrap();
     assert_eq!(player.player_id, config.player_id);
@@ -201,19 +196,11 @@ fn grounded_state_and_demo_timer_round_trip() {
         config: CarBodyConfig::OCTANE,
     };
     let config = bot_config(9, "Demoed", Team::Blue, 23);
-    let original = CarState {
-        is_on_ground: true,
-        wheels_with_contact: [Some(RaycastHitInfo {
-            hit_point: Vec3A::ZERO,
-            hit_normal: Vec3A::Z,
-            hit_fraction: 0.0,
-            user_info: UserInfoType::None,
-        }); 4],
-        is_demoed: true,
-        demo_respawn_timer: 1.75,
-        boost: 0.0,
-        ..CarState::default()
-    };
+    let mut original = CarState::default();
+    original.set_contact_flags(true, [true; 4]);
+    original.is_demoed = true;
+    original.demo_respawn_timer = 1.75;
+    original.boost = 0.0;
 
     let player = car_to_player_info(&info, &original, &config).unwrap();
     assert_eq!(player.air_state, AirState::OnGround);
@@ -358,14 +345,7 @@ fn flip_reset_uses_untimed_rlbot_sentinel() {
         config: CarBodyConfig::OCTANE,
     };
     let config = bot_config(10, "Reset", Team::Blue, 23);
-    let original = CarState {
-        is_on_ground: false,
-        has_jumped: false,
-        has_double_jumped: false,
-        has_flipped: false,
-        air_time_since_jump: 0.0,
-        ..CarState::default()
-    };
+    let original = CarState::default();
 
     let player = car_to_player_info(&info, &original, &config).unwrap();
     assert_eq!(player.dodge_timeout, -1.0);

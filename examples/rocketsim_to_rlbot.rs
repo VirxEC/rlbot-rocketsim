@@ -17,8 +17,7 @@ use rlbot_rocketsim::rlbot::flat::{
     CustomBot, MatchConfiguration, PlayerClass, PlayerConfiguration, PlayerLoadout,
 };
 use rlbot_rocketsim::rocketsim::{
-    Arena, CarBodyConfig, CarControls, CarState, GameMode, PhysState, RaycastHitInfo, Team,
-    UserInfoType, init_from_default,
+    Arena, CarBodyConfig, CarControls, CarCore, GameMode, PhysState, Team, init_from_default,
 };
 use rlbot_rocketsim::to_rlbot::ArenaExt;
 
@@ -28,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let car_index = arena.add_car(Team::Blue, CarBodyConfig::OCTANE);
     arena.set_car_state(
         car_index,
-        CarState {
+        CarCore {
             phys: PhysState {
                 pos: Vec3A::new(100.0, -2_000.0, 17.0),
                 rot_mat: Mat3A::from_euler(EulerRot::ZYX, 0.5, 0.1, -0.2),
@@ -42,14 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ..CarControls::default()
             },
             boost: 62.0,
-            is_on_ground: true,
-            wheels_with_contact: [Some(RaycastHitInfo {
-                hit_point: Vec3A::ZERO,
-                hit_normal: Vec3A::Z,
-                hit_fraction: 0.0,
-                user_info: UserInfoType::None,
-            }); 4],
-            ..CarState::default()
+            ..CarCore::DEFAULT
         },
     );
 

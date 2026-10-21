@@ -1,21 +1,20 @@
 [package]
 name = "rlbot-rocketsim"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Conversions and stateful enrichment between RLBot packets and RocketSim"
 readme = "README.md"
-license = "MIT"
 repository = "https://github.com/VirxEC/rlbot-rocketsim"
-homepage = "https://github.com/VirxEC/rlbot-rocketsim"
-keywords = ["rocket-league", "rlbot", "rocketsim", "simulation", "bots"]
+license = "MIT"
+keywords = ["bots", "rlbot", "rocket-league", "rocketsim", "simulation"]
 categories = ["game-development", "simulation"]
 exclude = ["AGENTS.md"]
 
 [dependencies]
-glam = "0.33.0"
-rlbot = { version = "0.6.0", default-features = false }
-rocketsim = "0.2.0"
+glam = "0.34.0"
+rlbot = { version = "0.7.0", default-features = false }
+rocketsim = "0.3.0"
 thiserror = "2.0.18"
 
 [lints.clippy]
