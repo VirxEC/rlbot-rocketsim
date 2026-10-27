@@ -1,6 +1,6 @@
 [package]
 name = "rlbot-rocketsim"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Conversions and stateful enrichment between RLBot packets and RocketSim"
@@ -14,7 +14,7 @@ exclude = ["AGENTS.md"]
 [dependencies]
 glam = "0.34.0"
 rlbot = { version = "0.7.0", default-features = false }
-rocketsim = "0.3.0"
+rocketsim = "0.3.3"
 thiserror = "2.0.18"
 
 [lints.clippy]

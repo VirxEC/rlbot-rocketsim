@@ -501,6 +501,7 @@ impl GameStateEnricher {
                             } else {
                                 (max_cooldown - pad.timer).clamp(0.0, max_cooldown)
                             },
+                            touching_car_idxs: Vec::new(),
                         }
                     })
                     .collect(),
@@ -717,7 +718,11 @@ impl GameStateEnricher {
 
     fn apply_boost_pads_from_plan(&mut self, boost_pads: Option<&[BoostPadState]>) {
         for (index, state) in boost_pads.unwrap_or_default().iter().enumerate() {
-            self.arena.set_boost_pad_state(index, *state);
+            // RLBot supplies only the cooldown. Keep the RocketSim-derived contact
+            // membership from the current arena state.
+            let mut current = self.arena.get_boost_pad_state(index);
+            current.cooldown = state.cooldown;
+            self.arena.set_boost_pad_state(index, current);
         }
     }
 }
